@@ -69,16 +69,17 @@ the MLP only for pooled rows. Local attention skips keys outside the
 layers. The forward pass reads back only the logits.
 
 On hardware that advertises packed dot products, the automatic path times
-the packed INT8 kernel and two vector FMA kernels once during load. It
-chooses a tile for each of the four projection shapes and for two ranges
+the packed INT8 kernel and vector FMA kernels once during load. It chooses
+a tile for each of the four projection shapes and for two ranges
 of batch sizes. For software adapters and devices without the packed-dot
 feature, the automatic path dequantizes tiles into shared memory for FP32
 accumulation. All paths use the same resident Q8 weights.
 
 Pass `projection: "int8"` to use the original packed kernel,
 `projection: "int8-vector"` to force the 32-token vector tile, or
-`projection: "fp32"` for dequantized projections. The
-`projectionTiles` getter reports the automatic hardware choices keyed
+`projection: "int8-panel"` to force the 32-token vector tile that loads
+four scale groups at once. Use `projection: "fp32"` for dequantized
+projections. The `projectionTiles` getter reports the automatic hardware choices keyed
 by input and output channel counts. The first map covers batches up to
 256 tokens and the second covers longer batches.
 
@@ -187,8 +188,8 @@ vector fused multiply-adds. The unscaled sums of 32 INT8 products fit
 exactly in FP32. The kernels apply the original group scales in the
 original order. [Dawn Metal lowering](https://github.com/google/dawn/blob/main/src/tint/lang/msl/writer/raise/raise.cc)
 
-Automatic selection compares the packed baseline with the 16-token and
-32-token vector tiles on the active device. It uses the real layer-zero
+Automatic selection compares the packed baseline and the vector tiles
+on the active device. It uses the real layer-zero
 weights and deterministic activations at 124 and 672 tokens, bounded by
 the model's batch cap. A vector kernel must match every projection output
 bit for bit and be at least 5% faster in the median of three paired
@@ -232,3 +233,59 @@ both answers matched. Each runtime used 478.6 MB of GPU buffers.
 
 These timings measure the software adapter. Hardware selection uses
 timings from the active browser and device.
+
+## Multi-group vector projections
+
+On an M1 Max running Chrome 157 with Metal, the vector kernels in `e6fa42e`
+ran the GPU kernels 2.95–3.07× as fast as `8178386` across four Patient
+Messages workloads. The comparison used the same Q8 weights and batches
+and matched all 53,040 logits bit for bit. In the uninstrumented refill
+benchmark, latency dropped from 7.02 s to 2.40 s. The four projections
+still accounted for 88% of the refill GPU time.
+[Profiled runtime](https://github.com/mkieffer1107/glide-rs-webgpu/tree/e6fa42e00c7912ab01531e27ac874524fefc0ada)
+
+The new kernels keep the Q8 weights and activations packed in workgroup
+memory. Each load covers two or four 32-channel scale groups, reducing
+the number of synchronizations. The kernels expand the bytes inside the
+inner loop and apply the group scales in the original order. The two
+tiles use 6.75 and 13.5 KiB of workgroup memory, respectively. The
+checkpoint and inference buffers are shared with the existing kernels.
+
+During calibration, a multi-group tile must match the packed output
+bit for bit. Its median paired time must be at least 5% lower than the
+current best candidate for that projection and batch range.
+
+```bash
+node tools/bench_encoder_projections.mjs model-04b-q8 --panel --baseline e6fa42e \
+  --tokens 665,672,750,539 --hardware
+node tools/test_encoder_webgpu.mjs model-04b-q8 examples/glide-04b.tokens.json cpu.json \
+  --question intent --hardware --compare-vector --warmup 1 --runs 5
+```
+
+The projection benchmark uses the same `e6fa42e` tile sizes as the refill
+profile. Attention output uses the 16×64 baseline, and the other three
+projections use the 32×64 baseline. The full-model benchmark alternates
+automatic selection with the 32×64 single-group tile. Use
+`--projection int8-panel --compare-vector` to force the four-group tile
+in a software WebGPU check.
+
+On Chromium 156 with SwiftShader, both multi-group tiles matched every
+projection output bit for bit, including residual writes and partial
+tiles. These are GPU timestamp medians of three dispatches after one
+warm-up per kernel, on four pinned CPU threads.
+
+| Projection | Batch tokens | `e6fa42e` tile | Two groups | Four groups |
+|---|---:|---:|---:|---:|
+| MLP expansion | 665 | 2,440 ms | 2,271 ms | 2,068 ms |
+| Attention QKV | 672 | 1,719 ms | 1,528 ms | 1,376 ms |
+| MLP contraction | 750 | 1,420 ms | 1,327 ms | 1,153 ms |
+| Attention output | 539 | 699 ms | 364 ms | 362 ms |
+
+In a paired check against the 32×64 single-group tile, the 539-token
+attention output went from 491 ms to 377 ms with four groups.
+
+A paired SwiftShader run of the 107- and 124-token prompts took 74.35 s
+with the single-group 32×64 tile and 63.76 s with the four-group tile.
+Both runtimes used 478.6 MB of inference buffers and returned the same
+510 logits bit for bit. The maximum absolute error against Rust Q8 was
+0.02524.

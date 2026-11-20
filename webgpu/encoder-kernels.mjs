@@ -301,22 +301,15 @@ fn main(@builtin(workgroup_id) gid: vec3<u32>, @builtin(local_invocation_id) lid
 `;
 }
 
-function projectVector(tokens) {
-    const offsets = Array.from({length: tokens / 8}, (_, i) => i * 8);
-    const forTokens = source => offsets.map(source).join("\n");
-    return `
+const vectorProjectionBindings = `
 struct Params { groups: u32, tokens: u32, rows: u32, first: u32, residual: u32 }
 @group(0) @binding(0) var<storage, read> weights: array<vec4<u32>>;
 @group(0) @binding(1) var<storage, read> acts: array<u32>;
 @group(0) @binding(2) var<storage, read_write> output: array<vec4<f32>>;
 @group(0) @binding(3) var<uniform> p: Params;
+`;
 
-const TOKENS = ${tokens}u;
-var<workgroup> wTile: array<vec4<f32>, 32u * 16u>;
-var<workgroup> aTile: array<vec4<f32>, 8u * TOKENS>;
-var<workgroup> wScale: array<vec4<f32>, 16>;
-var<workgroup> aScale: array<f32, TOKENS>;
-
+const vectorProjectionStore = `
 fn store(token: u32, row: u32, value: vec4<f32>) {
     if (token >= p.tokens) { return; }
     let i = ((p.first + token) * p.rows + row) / 4u;
@@ -326,7 +319,27 @@ fn store(token: u32, row: u32, value: vec4<f32>) {
         output[i] = value;
     }
 }
+`;
 
+function vectorFmas(offset, input) {
+    return `
+            let a${offset} = ${input};
+            s${offset} = fma(vec4(a${offset}.x), w0, s${offset});
+            s${offset} = fma(vec4(a${offset}.y), w1, s${offset});
+            s${offset} = fma(vec4(a${offset}.z), w2, s${offset});
+            s${offset} = fma(vec4(a${offset}.w), w3, s${offset});`;
+}
+
+function projectVector(tokens) {
+    const offsets = Array.from({length: tokens / 8}, (_, i) => i * 8);
+    const forTokens = source => offsets.map(source).join("\n");
+    return vectorProjectionBindings + `
+const TOKENS = ${tokens}u;
+var<workgroup> wTile: array<vec4<f32>, 32u * 16u>;
+var<workgroup> aTile: array<vec4<f32>, 8u * TOKENS>;
+var<workgroup> wScale: array<vec4<f32>, 16>;
+var<workgroup> aScale: array<f32, TOKENS>;
+` + vectorProjectionStore + `
 @compute @workgroup_size(16, 8)
 fn main(@builtin(workgroup_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>,
         @builtin(local_invocation_index) lane: u32) {
@@ -377,16 +390,95 @@ fn main(@builtin(workgroup_id) gid: vec3<u32>, @builtin(local_invocation_id) lid
             let w1 = wTile[w + 16u];
             let w2 = wTile[w + 32u];
             let w3 = wTile[w + 48u];
-            ${forTokens(offset => `
-            let a${offset} = aTile[a + ${offset}u];
-            s${offset} = fma(vec4(a${offset}.x), w0, s${offset});
-            s${offset} = fma(vec4(a${offset}.y), w1, s${offset});
-            s${offset} = fma(vec4(a${offset}.z), w2, s${offset});
-            s${offset} = fma(vec4(a${offset}.w), w3, s${offset});`)}
+            ${forTokens(offset => vectorFmas(offset, `aTile[a + ${offset}u]`))}
         }
         let ws = wScale[lid.x];
         ${forTokens(offset => `
         c${offset} = fma(s${offset}, ws * aScale[lid.y + ${offset}u], c${offset});`)}
+        workgroupBarrier();
+    }
+    ${forTokens(offset => `store(firstToken + lid.y + ${offset}u, row, c${offset});`)}
+}
+`;
+}
+
+function projectPanel(groups) {
+    const forTokens = source => [0, 8, 16, 24].map(source).join("\n");
+    return vectorProjectionBindings + `
+const GROUPS = ${groups}u;
+const TOKENS = 32u;
+
+// Keep codes packed until the inner loop. A four-group panel fits
+// in 13.5 KiB of workgroup storage including scales.
+var<workgroup> wTile: array<vec4<u32>, GROUPS * 128u>;
+var<workgroup> aTile: array<u32, GROUPS * 8u * TOKENS>;
+var<workgroup> wScale: array<vec4<f32>, GROUPS * 16u>;
+var<workgroup> aScale: array<f32, GROUPS * TOKENS>;
+
+fn signedValues(bytes: vec4<u32>) -> vec4<f32> {
+    // At 2^23, the f32 mantissa can represent each byte exactly.
+    return bitcast<vec4<f32>>(bytes | vec4(0x4b000000u)) - vec4(8388736.0);
+}
+
+fn decodeActivation(word: u32) -> vec4<f32> {
+    let biased = word ^ 0x80808080u;
+    let bytes = (vec4(biased) >> vec4(0u, 8u, 16u, 24u)) & vec4(255u);
+    return signedValues(bytes);
+}
+` + vectorProjectionStore + `
+@compute @workgroup_size(16, 8)
+fn main(@builtin(workgroup_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(local_invocation_index) lane: u32) {
+    let firstToken = gid.y * TOKENS;
+    let row = gid.x * 64u + lid.x * 4u;
+    ${forTokens(offset => `var c${offset} = vec4(0.0);`)}
+    for (var first = 0u; first < p.groups; first += GROUPS) {
+        let count = min(GROUPS, p.groups - first);
+        for (var i = lane; i < 128u * count; i += 128u) {
+            let group = i / 128u;
+            let part = (i / 16u) % 8u;
+            let n = i % 16u;
+            let col = n % 4u;
+            let base = ((gid.x * 4u + n / 4u) * p.groups + first + group) * 34u;
+            wTile[i] = weights[base + 2u + part * 4u + col];
+            if (part == 0u) {
+                let pairs = weights[base + col / 2u];
+                let halves = select(pairs.xy, pairs.zw, col % 2u != 0u);
+                wScale[group * 16u + n] = vec4(unpack2x16float(halves.x), unpack2x16float(halves.y));
+            }
+        }
+
+        for (var i = lane; i < 8u * TOKENS * count; i += 128u) {
+            let group = i / (8u * TOKENS);
+            let token = (i / 8u) % TOKENS;
+            let part = i % 8u;
+            var word = 0u;
+            var scale = 0.0;
+            if (firstToken + token < p.tokens) {
+                let a = ((firstToken + token) * p.groups + first + group) * 9u;
+                word = acts[a + 1u + part];
+                if (part == 0u) { scale = bitcast<f32>(acts[a]); }
+            }
+            aTile[(group * 8u + part) * TOKENS + token] = word;
+            if (part == 0u) { aScale[group * TOKENS + token] = scale; }
+        }
+
+        workgroupBarrier();
+        for (var group = 0u; group < count; group++) {
+            ${forTokens(offset => `var s${offset} = vec4(0.0);`)}
+            for (var part = 0u; part < 8u; part++) {
+                let a = (group * 8u + part) * TOKENS + lid.y;
+                let codes = wTile[(group * 8u + part) * 16u + lid.x];
+                let w0 = signedValues(codes & vec4(255u));
+                let w1 = signedValues((codes >> vec4(8u)) & vec4(255u));
+                let w2 = signedValues((codes >> vec4(16u)) & vec4(255u));
+                let w3 = signedValues(codes >> vec4(24u));
+                ${forTokens(offset => vectorFmas(offset, `decodeActivation(aTile[a + ${offset}u])`))}
+            }
+            let ws = wScale[group * 16u + lid.x];
+            ${forTokens(offset => `
+            c${offset} = fma(s${offset}, ws * aScale[group * TOKENS + lid.y + ${offset}u], c${offset});`)}
+        }
         workgroupBarrier();
     }
     ${forTokens(offset => `store(firstToken + lid.y + ${offset}u, row, c${offset});`)}
@@ -562,6 +654,15 @@ export async function createVectorProjection(device, tokens) {
     const name = `vector ${tokens}x${rows}`;
     const pipeline = await createPipeline(device, name, projectVector(tokens));
     return {name, pipeline, tokens, rows};
+}
+
+export async function createPanelProjection(device, groups) {
+    if (groups !== 2 && groups !== 4) throw new RangeError("Expected two or four Q8 scale groups");
+    const tokens = 32;
+    const rows = 64;
+    const name = `vector ${tokens}x${rows} K${groups * 32}`;
+    const pipeline = await createPipeline(device, name, projectPanel(groups));
+    return {name, pipeline, tokens, rows, groups};
 }
 
 export async function createEncoderKernels(device, packedDot, useFloat = false) {

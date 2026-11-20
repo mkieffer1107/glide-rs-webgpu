@@ -13,6 +13,7 @@ const {positionals, values} = parseArgs({
         projection: {type: "string", default: "auto"},
         question: {type: "string"},
         "compare-packed": {type: "boolean"},
+        "compare-vector": {type: "boolean"},
         "max-batch-tokens": {type: "string"},
         wasm: {type: "string"},
         runs: {type: "string", default: "1"},
@@ -25,12 +26,14 @@ const runs = Number(values.runs);
 const warmup = Number(values.warmup);
 const tolerance = Number(values["max-error"]);
 const maxBatchTokens = values["max-batch-tokens"] === undefined ? undefined : Number(values["max-batch-tokens"]);
+const compareProjection = values["compare-vector"] ? "int8-vector" : values["compare-packed"] ? "int8" : undefined;
 if (!modelDir || !requestFile || !referenceFiles.length || !Number.isSafeInteger(runs) || runs < 1 ||
     !Number.isSafeInteger(warmup) || warmup < 0 || !Number.isFinite(tolerance) || tolerance < 0 ||
+    (values["compare-packed"] && values["compare-vector"]) ||
     (maxBatchTokens !== undefined && (!Number.isInteger(maxBatchTokens) || maxBatchTokens < 2))) {
     throw new Error("Usage: node tools/test_encoder_webgpu.mjs MODEL REQUEST REFERENCE [REFERENCES...] " +
                     "[--question NAME] [--runs 3] [--warmup 1] [--wasm pkg] [--hardware] " +
-                    "[--projection auto|int8|int8-vector|fp32] [--compare-packed] " +
+                    "[--projection auto|int8|int8-vector|int8-panel|fp32] [--compare-packed|--compare-vector] " +
                     "[--max-batch-tokens 768] [--max-error 0.25]");
 }
 const json = path => JSON.parse(readFileSync(path, "utf8"));
@@ -55,7 +58,7 @@ try {
     const page = await browser.newPage();
     await page.goto(`http://127.0.0.1:${server.address().port}/`);
     const result = await page.evaluate(async ({
-        software, projection, withWasm, input, runs, warmup, comparePacked, maxBatchTokens,
+        software, projection, withWasm, input, runs, warmup, compareProjection, maxBatchTokens,
     }) => {
         const {Glide04bWebGPU} = await import("/webgpu/encoder.mjs");
         const adapter = await navigator.gpu?.requestAdapter({
@@ -89,9 +92,9 @@ try {
                 () => { throw new Error("Expected an over-context input to fail"); },
                 error => { if (!(error instanceof RangeError)) throw error; },
             );
-            if (comparePacked) {
+            if (compareProjection) {
                 baseline = await Glide04bWebGPU.load("/model/webgpu.json",
-                    {adapter, device, projection: "int8", maxBatchTokens});
+                    {adapter, device, projection: compareProjection, maxBatchTokens});
             }
             const engines = baseline ? [[model, gpuMs], [baseline, baselineMs]] : [[model, gpuMs]];
             for (let run = -warmup; run < runs; run++) {
@@ -107,7 +110,7 @@ try {
                 if (baselineLogits) {
                     for (const [i, row] of logits.entries()) {
                         if (row.some((value, j) => !Object.is(value, baselineLogits[i][j]))) {
-                            throw new Error(`Logits differ from the packed INT8 baseline for prompt ${i + 1}`);
+                            throw new Error(`Logits differ from ${compareProjection} for prompt ${i + 1}`);
                         }
                     }
                 }
@@ -158,7 +161,7 @@ try {
             maxContext: model.maxContext, gpuLoadMs, gpuMs, wasmLoadMs, wasmMs, gpuBufferBytes,
             comparison, logits: logits.map(row => Array.from(row))};
     }, {software, projection: values.projection, withWasm: Boolean(values.wasm), input, runs, warmup,
-        comparePacked: Boolean(values["compare-packed"]), maxBatchTokens});
+        compareProjection, maxBatchTokens});
 
     const argmax = row => row.indexOf(Math.max(...row));
     const checks = referenceFiles.map(file => {

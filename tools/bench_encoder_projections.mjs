@@ -9,11 +9,12 @@ const {chromium} = createRequire(import.meta.url)("playwright");
 const {positionals, values} = parseArgs({
     allowPositionals: true,
     options: {
-        baseline: {type: "string", default: "8178386"},
+        baseline: {type: "string"},
         tokens: {type: "string", default: "124"},
         runs: {type: "string", default: "5"},
         hardware: {type: "boolean"},
         vector: {type: "boolean"},
+        panel: {type: "boolean"},
     },
 });
 const [modelDir] = positionals;
@@ -21,12 +22,13 @@ const counts = values.tokens.split(",").map(Number);
 const runs = Number(values.runs);
 if (positionals.length !== 1 || ![1, 4].includes(counts.length) ||
     !counts.every(n => Number.isSafeInteger(n) && n >= 1 && n <= 7999) ||
-    !Number.isSafeInteger(runs) || runs < 1) {
+    !Number.isSafeInteger(runs) || runs < 1 || (values.vector && values.panel)) {
     throw new Error("Usage: node tools/bench_encoder_projections.mjs MODEL [--baseline 8178386] " +
-                    "[--tokens 124|665,672,750,539] [--runs 5] [--vector] [--hardware]");
+                    "[--tokens 124|665,672,750,539] [--runs 5] [--vector|--panel] [--hardware]");
 }
 const gitOptions = {cwd: fileURLToPath(new URL("..", import.meta.url)), encoding: "utf8"};
-const revision = execFileSync("git", ["rev-parse", "--verify", "--end-of-options", `${values.baseline}^{commit}`],
+const baselineRef = values.baseline ?? (values.panel ? "e6fa42e" : "8178386");
+const revision = execFileSync("git", ["rev-parse", "--verify", "--end-of-options", `${baselineRef}^{commit}`],
     gitOptions).trim();
 const baseline = execFileSync("git", ["show", `${revision}:webgpu/encoder-kernels.mjs`], gitOptions);
 
@@ -43,7 +45,7 @@ try {
     });
     const page = await browser.newPage();
     await page.goto(`http://127.0.0.1:${server.address().port}/`);
-    const result = await page.evaluate(async ({baseline, revision, counts, runs, software, vector}) => {
+    const result = await page.evaluate(async ({baseline, revision, counts, runs, software, vector, panel}) => {
         const adapter = await navigator.gpu?.requestAdapter({forceFallbackAdapter: software,
             powerPreference: "high-performance"});
         if (!adapter || (!software && adapter.info.isFallbackAdapter)) {
@@ -62,15 +64,25 @@ try {
             const manifestURL = new URL("/model/webgpu.json", location.href);
             const manifest = await (await fetch(manifestURL)).json();
             const old = await before.createEncoderKernels(device, packedDot);
-            const original = {
+            const packedBaseline = {
                 name: revision, pipeline: old.project, rows: before.PROJECTION_ROWS, tokens: before.PROJECTION_TOKENS,
             };
-            const candidates = vector
-                ? await Promise.all([16, 32].map(n => after.createVectorProjection(device, n)))
-                : [{
+            let baselines;
+            let candidates;
+            if (panel) {
+                if (typeof before.createVectorProjection !== "function") {
+                    throw new Error("--panel needs a baseline revision with vector FMA projections");
+                }
+                baselines = await Promise.all([16, 32].map(n => before.createVectorProjection(device, n)));
+                candidates = await Promise.all([2, 4].map(n => after.createPanelProjection(device, n)));
+            } else if (vector) {
+                candidates = await Promise.all([16, 32].map(n => after.createVectorProjection(device, n)));
+            } else {
+                candidates = [{
                     name: "current", pipeline: (await after.createEncoderKernels(device, packedDot)).project,
                     rows: after.PROJECTION_ROWS, tokens: after.PROJECTION_TOKENS,
                 }];
+            }
             const storage = GPUBufferUsage.STORAGE;
             const write = GPUBufferUsage.COPY_DST;
             const copy = GPUBufferUsage.COPY_SRC;
@@ -94,6 +106,8 @@ try {
             for (const [i, name] of ["mlp.Wi", "attn.Wqkv", "mlp.Wo", "attn.Wo"].entries()) {
                 const tokens = counts[i] ?? counts[0];
                 const residual = i >= 2;
+                // The M1 Max profile used 16 tokens for attention output and 32 for the other projections.
+                const original = panel ? baselines[i === 3 ? 0 : 1] : packedBaseline;
                 const tensor = manifest.tensors[`layers.0.${name}.weight`];
                 if (tensor?.dtype !== "q8x16") throw new Error(`Expected Q8 weights for ${name}`);
                 const bytes = await readWeightRange(manifest, manifestURL,
@@ -179,7 +193,7 @@ try {
                                     variant.bitExact = false;
                                     const error = Math.abs(values[j] - reference[j]);
                                     variant.maxError = Math.max(variant.maxError, error);
-                                    if (vector || error > 3e-5 + 2e-6 * Math.abs(reference[j])) {
+                                    if (vector || panel || error > 3e-5 + 2e-6 * Math.abs(reference[j])) {
                                         throw new Error(`${name} ${variant.name} differs from baseline at element ${j}`);
                                     }
                                 }
@@ -195,7 +209,7 @@ try {
                 const [reference, ...results] = variants.map(({name, ms, bitExact, maxError}) => ({
                     name, ms, bitExact, maxError, medianMs: median(ms),
                 }));
-                const result = vector ? {candidates: results} : {
+                const result = vector || panel ? {baselineKernel: reference.name, candidates: results} : {
                     bitExact: results[0].bitExact, maxError: results[0].maxError,
                     tunedMs: results[0].ms, tunedMedianMs: results[0].medianMs,
                 };
@@ -210,7 +224,7 @@ try {
             URL.revokeObjectURL(baselineURL);
             device.destroy();
         }
-    }, {baseline, revision, counts, runs, software, vector: Boolean(values.vector)});
+    }, {baseline, revision, counts, runs, software, vector: Boolean(values.vector), panel: Boolean(values.panel)});
     console.log(JSON.stringify(result, null, 2));
 } finally {
     await browser?.close();

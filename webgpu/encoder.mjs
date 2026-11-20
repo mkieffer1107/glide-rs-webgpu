@@ -1,6 +1,7 @@
 import { uploadWeightSet } from "./weights.mjs";
 import {
-    createEncoderKernels, createVectorProjection, PACKED_GROUP_BYTES, PROJECTION_ROWS, PROJECTION_TOKENS, QUERY_TILE,
+    createEncoderKernels, createPanelProjection, createVectorProjection,
+    PACKED_GROUP_BYTES, PROJECTION_ROWS, PROJECTION_TOKENS, QUERY_TILE,
     FLOAT_PROJECTION_ROWS, FLOAT_PROJECTION_TOKENS,
 } from "./encoder-kernels.mjs";
 
@@ -120,6 +121,12 @@ function gpuArray(device, label, array) {
 
 const projectionKey = (columns, width) => `${columns}x${width}`;
 
+function optionalTuningFailure(error) {
+    const cause = error.cause ?? error;
+    return cause instanceof GPUOutOfMemoryError || cause instanceof GPUValidationError ||
+        cause instanceof GPUPipelineError || cause.name === "OperationError";
+}
+
 async function tuneProjections(device, weights, config, cap, baseline, candidates, signal) {
     const {hidden, intermediate} = config;
     const shapes = [
@@ -210,16 +217,20 @@ async function tuneProjections(device, weights, config, cap, baseline, candidate
                         variant.times.push(performance.now() - started);
                     }
                 }
-                let best = baseline;
+                const original = variants[0];
+                let best = original;
                 let bestRatio = 0.95;
                 for (const variant of eligible.slice(1)) {
-                    const ratios = variant.times.map((ms, i) => ms / variants[0].times[i]).sort((a, b) => a - b);
-                    if (ratios[1] < bestRatio) {
-                        best = variant.tile;
+                    // Compare panels directly to the best of the previous choices.
+                    const reference = variant.tile.groups ? best : original;
+                    const threshold = variant.tile.groups ? 0.95 : bestRatio;
+                    const ratios = variant.times.map((ms, i) => ms / reference.times[i]).sort((a, b) => a - b);
+                    if (ratios[1] < threshold) {
+                        best = variant;
                         bestRatio = ratios[1];
                     }
                 }
-                choices.set(projectionKey(columns, width), best);
+                choices.set(projectionKey(columns, width), best.tile);
             }
             selections.push(choices);
         }
@@ -317,7 +328,9 @@ export class Glide04bWebGPU {
     #pending = Promise.resolve();
 
     static async load(url, {adapter, device, signal, onProgress, maxBatchTokens, projection = "auto"} = {}) {
-        if (!["auto", "int8", "int8-vector", "fp32"].includes(projection)) throw new Error("Unknown projection kernel");
+        if (!["auto", "int8", "int8-vector", "int8-panel", "fp32"].includes(projection)) {
+            throw new Error("Unknown projection kernel");
+        }
         const manifestURL = new URL(url, globalThis.location?.href);
         const manifest = await fetchJSON(manifestURL, signal);
         const [c, d] = await Promise.all([
@@ -359,6 +372,10 @@ export class Glide04bWebGPU {
                 plan.mode = projection;
                 plan.primary = await createVectorProjection(device, 32);
             }
+            if (projection === "int8-panel") {
+                plan.mode = projection;
+                plan.primary = await createPanelProjection(device, 4);
+            }
             weights = await uploadWeightSet(device, manifest, manifestURL, config.names, {signal, onProgress});
             await checked(device, () => {
                 rotary[0] = gpuArray(device, "GLiDE full RoPE", rotaryTable(config.maxContext, config.globalTheta));
@@ -368,15 +385,15 @@ export class Glide04bWebGPU {
             if (projection === "auto" && packedDot && software === false && cap > 32) {
                 try {
                     const candidates = await Promise.all([16, 32].map(tokens => createVectorProjection(device, tokens)));
+                    const panels = await Promise.allSettled([2, 4].map(groups => createPanelProjection(device, groups)));
+                    for (const panel of panels) {
+                        if (panel.status === "fulfilled") candidates.push(panel.value);
+                        else if (!optionalTuningFailure(panel.reason)) throw panel.reason;
+                    }
                     plan.tuned = await tuneProjections(device, weights, config, cap, primary, candidates, signal);
                 } catch (error) {
                     signal?.throwIfAborted();
-                    // Optional tuning can fail on a device that fits the packed kernel.
-                    const cause = error.cause ?? error;
-                    if (!(cause instanceof GPUOutOfMemoryError || cause instanceof GPUValidationError ||
-                          cause instanceof GPUPipelineError || cause.name === "OperationError")) {
-                        throw error;
-                    }
+                    if (!optionalTuningFailure(error)) throw error;
                 }
             }
             signal?.throwIfAborted();
