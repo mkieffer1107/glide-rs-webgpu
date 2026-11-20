@@ -1,0 +1,16 @@
+target/
+.venv/
+.bench/
+.pkg/
+model-q4/
+model-q4-tiled/
+model-q8/
+model-bf16/
+GLiDE-2B/
+*.gguf
+*.safetensors
+weights.bin
+__pycache__/
+*.pyc
+model-*/
+*.zip

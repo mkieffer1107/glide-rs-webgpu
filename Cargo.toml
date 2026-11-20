@@ -1,0 +1,40 @@
+[package]
+name = "glide-cpu"
+version = "0.1.0"
+edition = "2021"
+description = "Experimental quantized CPU inference for Fastino GLiDE-2B decisions; WASM-oriented core"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+half = "2.6"
+indexmap = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = { version = "0.2", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+memmap2 = "0.9"
+rayon = "1.10"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[[bin]]
+name = "glide-cpu"
+path = "src/main.rs"

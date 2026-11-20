@@ -1,0 +1,122 @@
+[
+  {
+    "name": "astronomy", "topic": "astronomy", "expected": "saturn",
+    "state": "Europa orbits Jupiter. Titan orbits Saturn. Triton orbits Neptune.",
+    "question": {"type": "choice", "instructions": "What planet does Titan orbit?", "criteria": {"neptune": "Neptune", "saturn": "Saturn", "jupiter": "Jupiter", "mars": "Mars"}}
+  },
+  {
+    "name": "inventory", "topic": "arithmetic", "expected": "12",
+    "state": "The shop had 19 blue pens. It sold 8 blue pens and received one blue pen in a return. Sales of red pens do not affect the blue count.",
+    "question": {"type": "choice", "instructions": "How many blue pens are in stock now?", "criteria": {"10": "", "11": "", "12": "", "13": "", "19": ""}}
+  },
+  {
+    "name": "calendar", "topic": "scheduling", "expected": "tuesday",
+    "state": "Amal is available Monday and Tuesday. Beau is available Tuesday and Wednesday. The room is free Tuesday and Friday.",
+    "question": {"type": "choice", "instructions": "Pick a day when both people and the room are available.", "criteria": {"monday": "Monday", "tuesday": "Tuesday", "wednesday": "Wednesday", "friday": "Friday"}}
+  },
+  {
+    "name": "ownership", "topic": "coreference", "expected": "nina",
+    "state": "Nina lent her umbrella to Jules. Jules dropped a bag at the station. Nina picked up the bag and returned it to Jules the next day.",
+    "question": {"type": "choice", "instructions": "Who owns the umbrella?", "criteria": {"jules": "Jules", "nina": "Nina", "unknown": "Unknown"}}
+  },
+  {
+    "name": "sequence", "topic": "procedural reasoning", "expected": "false",
+    "state": "First turn the mixer off and unplug it. The jar can be lifted only after both steps are complete. Kim turned the mixer off, but it remains plugged in.",
+    "question": {"type": "noul", "instructions": "Do the instructions permit Kim to lift the jar now?"}
+  },
+  {
+    "name": "customer-support", "topic": "support routing", "expected": "billing",
+    "state": "I can sign in and the sync feature works. My card statement shows two identical charges for a single subscription renewal. Could you reverse the duplicate?",
+    "question": {"type": "choice", "instructions": "Which team should take this ticket?", "criteria": {"accounts": "Login and account access", "engineering": "Product bugs", "billing": "Payments and refunds", "sales": "New sales"}}
+  },
+  {
+    "name": "multilingue", "topic": "Spanish reading", "expected": "false",
+    "state": "El museo abre de martes a domingo, de diez de la mañana a seis de la tarde. Todos los lunes permanece cerrado.",
+    "question": {"type": "noul", "instructions": "¿Se puede visitar el museo un lunes a las once de la mañana?", "criteria": {"true": "Sí", "false": "No"}}
+  },
+  {
+    "name": "japanese", "topic": "Japanese reading", "expected": "kyoto",
+    "state": "金曜日は大阪に行きます。土曜日は京都で美術館を見学します。日曜日に東京へ帰ります。",
+    "question": {"type": "choice", "instructions": "土曜日に訪れる都市はどこですか？", "criteria": {"osaka": "大阪", "tokyo": "東京", "kyoto": "京都", "sapporo": "札幌"}}
+  },
+  {
+    "name": "food-label", "topic": "food ingredients", "expected": "true",
+    "state": "Ingredients: wheat flour, sunflower oil, oat bran, skimmed milk powder, baking powder, and sea salt. May contain traces of sesame.",
+    "question": {"type": "noul", "instructions": "Does the ingredient list explicitly include milk?"}
+  },
+  {
+    "name": "finance", "topic": "financial statements", "expected": "up",
+    "state": {"currency": "USD", "operating_expense": {"2024": 1200, "2025": 1600}, "revenue": {"2024": 2200, "2025": 2250}},
+    "question": {"type": "choice", "instructions": "How did operating expense change from 2024 to 2025?", "criteria": {"down": "Decreased", "flat": "No change", "up": "Increased", "missing": "Unavailable"}}
+  },
+  {
+    "name": "contract", "topic": "contract reading", "expected": "tenant",
+    "state": "Fictional lease clause. The landlord maintains the roof and the heating system. The tenant must replace smoke detector batteries and notify the landlord promptly about water leaks. Repairs to the building exterior require the landlord's written approval.",
+    "question": {"type": "choice", "instructions": "Who is assigned to replace the smoke detector batteries under this clause?", "criteria": {"landlord": "The landlord", "tenant": "The tenant", "both": "Both parties jointly", "unassigned": "Neither party is named"}}
+  },
+  {
+    "name": "fiction", "topic": "literary inference", "expected": "homesick",
+    "state": "After arriving in a new city, Mira kept a photo of her old street on her desk. Every time a delivery truck sounded its horn, she imagined the bakery near the school she used to attend. She wrote letters to the neighbor who used to greet her each morning.",
+    "question": {"type": "choice", "instructions": "Which interpretation is most supported by Mira's behavior?", "criteria": {"relieved": "She is relieved to forget her old neighborhood", "homesick": "She misses her old neighborhood", "unconcerned": "She has no strong memories of the old neighborhood", "lost": "She is planning the fastest route to the new bakery"}}
+  },
+  {
+    "name": "data-table", "topic": "table reasoning", "expected": "harbor",
+    "state": "Site | Rain Tuesday | Rain Wednesday\nHarbor | 8 mm | 2 mm\nHill | 3 mm | 5 mm\nValley | 1 mm | 8 mm\nPlains | 4 mm | 4 mm",
+    "question": {"type": "choice", "instructions": "Which site had the highest total rain across both days?", "criteria": {"plains": "Plains", "valley": "Valley", "hill": "Hill", "harbor": "Harbor"}}
+  },
+  {
+    "name": "withheld", "topic": "evidence and uncertainty", "expected": "unknown",
+    "state": "June 8: The company announced that the new branch would open later this year. No location, date, or staffing figure was given. The existing branch on Oak Street will remain open.",
+    "question": {"type": "choice", "instructions": "What is the street address of the new branch?", "criteria": {"oak": "Oak Street", "main": "Main Street", "unknown": "The address is not given"}}
+  },
+  {
+    "name": "explicit-override", "topic": "policy exception", "expected": "true",
+    "state": "Members normally have 14 days to return an item. Books bought during the December sale can be returned within 30 days. Lee is a member and bought a book during the December sale. It is now 23 days after the purchase.",
+    "question": {"type": "noul", "instructions": "Is the book still eligible to be returned?"}
+  },
+  {
+    "name": "code-review", "topic": "program tracing", "expected": "7",
+    "state": "def total(nums):\n    result = 0\n    for n in nums:\n        if n % 2 == 1:\n            result += n\n    return result\n\nvalue = total([1, 4, 2, 1, 5])",
+    "question": {"type": "choice", "instructions": "What value does this Python program assign to value?", "criteria": {"6": "", "7": "", "8": "", "13": ""}}
+  },
+  {
+    "name": "science", "topic": "scientific reasoning", "expected": "light",
+    "state": "Two groups of seedlings receive equal amounts of water, soil, and fertilizer and experience the same temperature. One group receives eight hours of light per day and the other receives four. Both groups are measured after ten days.",
+    "question": {"type": "choice", "instructions": "Which independent variable was intentionally changed?", "criteria": {"light": "Light duration", "water": "Water amount", "temperature": "Temperature", "height": "Final height"}}
+  },
+  {
+    "name": "score-quality", "topic": "rubric scoring", "expected": "2",
+    "state": "The requested deliverables were an invoice, a packed receipt, and a tracking number. Mia sent the invoice and the tracking number but had no packed receipt.",
+    "question": {"type": "score", "instructions": "Score the number of deliverables received.", "criteria": ["none", "one", "two", "three"]}
+  },
+  {
+    "name": "score-impact", "topic": "incident severity", "expected": "1",
+    "state": "A website's help article has a typo in its heading. Customers can still sign in, browse articles, and contact support.",
+    "question": {"type": "score", "instructions": "Assign the incident severity using the supplied levels.", "criteria": ["No issue reported", "Cosmetic issue without loss of functionality", "A feature is unavailable", "The whole site is inaccessible"]}
+  },
+  {
+    "name": "score-budget", "topic": "budget classification", "expected": "0",
+    "state": "The itinerary is entirely local and has no expenses. Transit is covered by an existing pass and the event provides free entry and meals.",
+    "question": {"type": "score", "instructions": "Choose the total additional cost band.", "criteria": ["No additional cost", "More than $0 and under $25", "$25 to $99", "$100 or more"]}
+  },
+  {
+    "name": "single-label", "topic": "single-option boundary", "expected": "acknowledged",
+    "state": "The carrier reports that it delivered the package.",
+    "question": {"type": "choice", "instructions": "Acknowledge the carrier update.", "criteria": {"acknowledged": ""}}
+  },
+  {
+    "name": "option-width", "topic": "wide option list", "expected": "opal-27",
+    "state": "A training library has many shelf codes. The catalog entry for Ceramics 301 lists shelf code OPAL-27. Ceramics 302 is on OPAL-29.",
+    "question": {"type": "choice", "instructions": "Select the shelf code for Ceramics 301.", "criteria": {"opal-01":"","opal-02":"","opal-03":"","opal-04":"","opal-05":"","opal-06":"","opal-07":"","opal-08":"","opal-09":"","opal-10":"","opal-11":"","opal-12":"","opal-13":"","opal-14":"","opal-15":"","opal-16":"","opal-17":"","opal-18":"","opal-19":"","opal-20":"","opal-21":"","opal-22":"","opal-23":"","opal-24":"","opal-25":"","opal-26":"","opal-27":"","opal-28":"","opal-29":"","opal-30":"","opal-31":"","opal-32":""}}
+  },
+  {
+    "name": "incident-report", "topic": "document synthesis", "expected": "manual",
+    "state": "At 07:40, a mains interruption stopped the air handling fans in a training facility. The emergency lighting stayed on. Power to the control room was restored automatically at 07:44. The operator, who was still in the briefing room, remotely checked the status panel from a mobile terminal. It showed that the fans remained stopped. The automatic restart option had been intentionally disabled on Monday while the maintenance team inspected the pressure sensors. A new event was logged at 08:01 when the maintenance team finished checking the sensors. The security desk continued taking calls and receiving visitors throughout the event. At 08:10, the operator went to the control room and enabled each fan from the local panel after checking its current draw. The briefing room thermometer briefly showed a two-degree increase. The evening handoff initially said all normal equipment had resumed immediately after mains power returned. The engineer's corrected handoff notes that the status panel and sensor inspection did not restart the fans. They were restored in a later step by the operator.",
+    "question": {"type": "choice", "instructions": "Which event directly restored the air handling fans?", "criteria": {"mains": "Automatic restoration of mains power at 07:44", "inspection": "Completion of sensor inspection at 08:01", "manual": "Operator enabled the fans from the local panel at 08:10", "handoff": "Corrected evening handoff"}}
+  },
+  {
+    "name": "debate", "topic": "argument attribution", "expected": "elena",
+    "state": "The council considered a plan to close Cedar Street to cars during the summer festival. Ravi said he wanted street vendors to stay in the same positions because the town had already issued a printed map. Elena objected that people who use wheelchairs would have difficulty reaching the information booth if it stayed on the steep upper block. Her proposal moved only the information booth to the flat block by the library. Jade suggested moving the sound stage indoors because of complaints about evening noise. Robin noted that the festival budget already included signs for temporary street closure, but did not ask for a change to either the booth or the stage. The chair grouped the indoor stage and booth relocation into separate motions. The booth relocation motion was discussed first. The record includes the concern about the steep block even though the booth ultimately remained in place.",
+    "question": {"type": "choice", "instructions": "Who raised the accessibility concern about the information booth?", "criteria": {"robin": "Robin", "ravi": "Ravi", "jade": "Jade", "elena": "Elena"}}
+  }
+]

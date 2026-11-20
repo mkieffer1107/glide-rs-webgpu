@@ -1,0 +1,26 @@
+name: CPU correctness checks
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test Rust core
+        run: cargo test --release --locked
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.12'
+      - name: Test quantization converter
+        run: |
+          uv sync --locked
+          uv run --locked tools/test_quant.py
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Check WebAssembly library
+        run: cargo check --locked --target wasm32-unknown-unknown --release --features wasm --lib

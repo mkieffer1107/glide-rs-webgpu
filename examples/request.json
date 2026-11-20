@@ -1,0 +1,21 @@
+{
+  "state": {
+    "ticket": "My order arrived damaged. Please send a replacement.",
+    "priority": "normal"
+  },
+  "questions": {
+    "intent": {
+      "type": "choice",
+      "instructions": "What action should customer support take?",
+      "criteria": {
+        "replace": "Send a replacement for a damaged order",
+        "refund": "Refund the order",
+        "investigate": "Investigate before acting"
+      }
+    },
+    "urgent": {
+      "type": "noul",
+      "instructions": "Does this need escalation within one hour?"
+    }
+  }
+}
