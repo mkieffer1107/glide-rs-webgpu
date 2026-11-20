@@ -55,6 +55,63 @@ export async function readWeightRange(manifest, manifestURL, range, signal) {
     return bytes;
 }
 
+// Fill the resident tensors with coalesced range requests. A tensor can span
+// several requests while remaining a single bindable GPU buffer.
+export async function uploadWeightSet(device, manifest, manifestURL, names, {signal, onProgress} = {}) {
+    const tensors = names.map(name => ({name, ...manifest.tensors[name]}))
+        .sort((a, b) => a.offset - b.offset);
+    const limit = Math.min(device.limits.maxStorageBufferBindingSize, device.limits.maxBufferSize);
+    const chunk = Math.floor(Math.min(manifest.chunkBytes, 32 * 1024 ** 2) / 4) * 4;
+    const total = manifest.weightBytes;
+    if (!Number.isSafeInteger(total) || total < 4 || total % 4 ||
+        !Number.isSafeInteger(chunk) || chunk < 4) {
+        throw new Error("Invalid weight stream length");
+    }
+    const buffers = new Map();
+    let previousEnd = 0;
+    for (const {name, offset, nbytes} of tensors) {
+        if (!Number.isSafeInteger(offset) || offset % 4 || offset < previousEnd ||
+            !Number.isSafeInteger(nbytes) || nbytes < 4 || nbytes % 4 || offset + nbytes > total) {
+            throw new Error(`Invalid byte range for ${name}`);
+        }
+        if (nbytes > limit) throw new Error(`${name} exceeds this device's storage buffer limit`);
+        previousEnd = offset + nbytes;
+    }
+    try {
+        device.pushErrorScope("out-of-memory");
+        try {
+            for (const {name, nbytes} of tensors) {
+                buffers.set(name, device.createBuffer({
+                    label: name, size: nbytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+                }));
+            }
+        } finally {
+            const error = await device.popErrorScope();
+            if (error) throw new Error(`Cannot allocate the GLiDE weights: ${error.message}`);
+        }
+        let first = 0;
+        for (let offset = 0; offset < total; offset += chunk) {
+            const byteLength = Math.min(chunk, total - offset);
+            const end = offset + byteLength;
+            const bytes = await readWeightRange(manifest, manifestURL, {offset, byteLength}, signal);
+            for (let i = first; i < tensors.length && tensors[i].offset < end; i++) {
+                const tensor = tensors[i];
+                const lo = Math.max(offset, tensor.offset);
+                const hi = Math.min(end, tensor.offset + tensor.nbytes);
+                device.queue.writeBuffer(buffers.get(tensor.name), lo - tensor.offset, bytes, lo - offset, hi - lo);
+                if (hi === tensor.offset + tensor.nbytes) first = i + 1;
+            }
+            // Bound the upload queue's temporary memory to one range at a time.
+            await device.queue.onSubmittedWorkDone();
+            onProgress?.(end, total);
+        }
+        return buffers;
+    } catch (error) {
+        for (const buffer of buffers.values()) buffer.destroy();
+        throw error;
+    }
+}
+
 // Consumers own each yielded GPU buffer and can release it after its last dispatch.
 export async function* uploadTensor(device, manifest, manifestURL, name, options = {}) {
     const tensor = manifest.tensors[name];

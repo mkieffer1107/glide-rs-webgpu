@@ -127,8 +127,12 @@ comparison. Weight sizes exclude tokenizers and metadata.
 
 ## Browser export
 
+The [WebGPU runtime guide](glide-04b-webgpu.md) covers GPU inference with
+the Q8 export, the runnable browser example, and browser benchmarks.
+
+### WASM CPU build
+
 ```bash
-uv run --locked tools/webgpu_manifest.py --model model-04b-q8
 rustup target add wasm32-unknown-unknown
 RUSTFLAGS='-C target-feature=+simd128' cargo build --locked --release \
   --target wasm32-unknown-unknown --features wasm --lib
@@ -139,18 +143,12 @@ wasm-bindgen --target web --out-dir pkg \
 Use a `wasm-bindgen` CLI matching the version in `Cargo.lock`. `WasmGlide`
 accepts the packed model and pre-tokenized input. Its `predictLogits` method
 returns the full readout. The WASM Q8 fallback uses FP32 activations. WebGPU
-projections use quantized activations and get the tensor ranges from
-`webgpu.json`. The JavaScript modules cover buffer streaming and projections.
-The browser's WASM CPU path evaluates the whole encoder.
+uses the same packed checkpoint and loads its ranges from `webgpu.json`.
 
 A 128-token Node.js WASM smoke test matched the PyTorch choice. Across all 255
 logits, its mean absolute error was 0.0074 and its maximum error was 0.0328.
-The single-threaded forward took 20.1 s in Node.js. In Chromium with the
-SwiftShader adapter, the WebGPU test streamed weight ranges and checked
-real MLP and QKV projections against an independent calculation. The maximum
-projection error was 0.0000006. WebGPU validation covers individual
-projections. The `pkg/` browser build generated above runs complete inference
-on the CPU.
+The single-threaded forward took 20.1 s in Node.js. The `pkg/` browser
+build generated above runs complete inference on the CPU.
 
 The model files are distributed under the Fastino Community License and
 include Ettin's original MIT license. [Fastino checkpoint](https://huggingface.co/fastino/GLiDE-0.4B/tree/6bda7ab91aeb36dcad6d27828a8871e548c7fc71)

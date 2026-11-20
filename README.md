@@ -6,6 +6,7 @@ choice, yes/no (`noul`), and score responses for text and JSON states.
 
 The sections below cover GLiDE-2B. The [GLiDE-0.4B guide](docs/glide-04b.md)
 covers the ModernBERT encoder, CPU benchmarks, and browser export.
+For full GPU inference in the browser, see the [GLiDE-0.4B WebGPU guide](docs/glide-04b-webgpu.md).
 
 ## Run the compact Q8 download
 

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GLiDE-0.4B WebGPU</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { max-width: 42rem; margin: 4rem auto; padding: 0 1.25rem; }
+  h1 { margin-bottom: .5rem; }
+  p { line-height: 1.5; }
+  button, input { font: inherit; }
+  button { padding: .45rem .8rem; }
+  progress { width: 100%; margin-bottom: 1rem; }
+  label { display: block; margin: 1rem 0 .4rem; }
+  pre { padding: 1rem; border: 1px solid GrayText; border-radius: .4rem; overflow: auto; }
+</style>
+<main>
+  <h1>GLiDE-0.4B WebGPU</h1>
+  <p>Run the included sample or choose a tokenized request from <code>tools/make_request.py</code>.</p>
+  <button id="load">Load Q8 model</button>
+  <p id="status" role="status">Ready to load 469 MB of weights.</p>
+  <progress id="progress" value="0" max="1" hidden aria-label="Model download"></progress>
+  <label for="request">Tokenized request file (optional)</label>
+  <input id="request" type="file" accept="application/json,.json">
+  <button id="run" disabled>Run decision</button>
+  <pre id="result" hidden></pre>
+</main>
+<script type="module" src="/examples/glide-04b.mjs"></script>
+</html>
