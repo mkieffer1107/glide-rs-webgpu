@@ -9,6 +9,7 @@ from pathlib import Path
 from make_request import load_prompter, prepare, use_upstream
 
 LENGTHS = (20000, 12000, 8192, 4096, 2048, 1024, 512, 256, 96)
+ENCODER_LENGTHS = (128, 129, 256, 512, 1024, 2048, 4096, 7999)
 POSITIONS = ("late", "early", "middle")
 
 
@@ -43,7 +44,7 @@ def context_case(prompter, length, position):
     low, high = 0, len(distractions)
     while low + 1 < high:
         mid = (low + high) // 2
-        if len(render(mid)["input_ids"]) <= length:
+        if len(render(mid)["input_ids"]) < length:
             low = mid
         else:
             high = mid
@@ -83,16 +84,20 @@ def topic_cases(prompter):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True, help="Downloaded Fastino GLiDE-2B snapshot")
+    parser.add_argument("--model", required=True, help="Downloaded Fastino GLiDE snapshot")
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--lengths", nargs="+", type=int, default=LENGTHS)
+    parser.add_argument("--lengths", nargs="+", type=int)
     args = parser.parse_args()
-    if len(args.lengths) != len(set(args.lengths)) or any(n < 96 for n in args.lengths):
-        parser.error("lengths must be unique and at least 96 tokens")
-    args.output.mkdir(parents=True, exist_ok=True)
     prompter = load_prompter(use_upstream(args.model))
+    limit = getattr(prompter.tokenizer, "max_len", None)
+    lengths = args.lengths or (ENCODER_LENGTHS if limit is not None else LENGTHS)
+    if len(lengths) != len(set(lengths)) or any(n < 96 for n in lengths):
+        parser.error("lengths must be unique and at least 96 tokens")
+    if limit is not None and max(lengths) > limit:
+        parser.error(f"encoder context limit is {limit} tokens")
+    args.output.mkdir(parents=True, exist_ok=True)
     sweep, labels = {}, {}
-    for length in args.lengths:
+    for length in lengths:
         if length in LENGTHS:
             position = POSITIONS[LENGTHS.index(length) % len(POSITIONS)]
         else:
@@ -103,7 +108,7 @@ def main():
         write_json(args.output / f"length-{length}.json", {"questions": {name: sweep[name]}})
     write_json(args.output / "sweep.json", {"questions": sweep})
     by_length = {len(q["input_ids"]): (name, q) for name, q in sweep.items()}
-    mixed = (1024, 512, 256, 96)
+    mixed = (1024, 512, 256, 128 if limit is not None else 96)
     if all(n in by_length for n in mixed):
         write_json(args.output / "mixed.json", {"questions": dict(by_length[n] for n in mixed)})
     topics, topic_labels = topic_cases(prompter)

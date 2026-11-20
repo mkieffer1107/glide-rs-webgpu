@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stream a Fastino GLiDE-2B checkpoint to memory-mappable quantized weights.
+"""Stream a Fastino GLiDE checkpoint to memory-mappable packed weights.
 
 One row group at a time is copied from safetensors. Requires only Python, numpy,
 PyTorch (for BF16 -> float32) and safetensors. No GPU required.
@@ -149,33 +149,61 @@ def convert(source, output, embeddings='f16', chunk=32, layout='row', weight_bit
         raise ValueError('--q8-attention requires --layout tile16 --weight-bits 4')
     if q4_codebook and (weight_bits != 4 or layout != 'tile16'):
         raise ValueError('--q4-codebook requires --layout tile16 --weight-bits 4')
+    if embeddings == 'q8' and layout != 'tile16':
+        raise ValueError('Q8 embeddings require --layout tile16')
     if weight_bits == 16:
         embeddings = 'bf16'
     source, output = Path(source), Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    for filename in ('config.json', 'decision_config.json', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json'):
+    for filename in ('config.json', 'decision_config.json', 'tokenizer.json', 'tokenizer_config.json',
+                     'special_tokens_map.json', 'LICENSE', 'NOTICE'):
         if (source / filename).exists():
             shutil.copyfile(source / filename, output / filename)
     if not (output / 'config.json').exists() or not (output / 'decision_config.json').exists():
-        raise SystemExit('Missing config.json or decision_config.json; download fastino/GLiDE-2B first.')
+        raise SystemExit('Missing config.json or decision_config.json; download the GLiDE checkpoint first.')
+
+    decision = json.loads((source / 'decision_config.json').read_text())
+    encoder = decision.get('backbone') == 'encoder'
+    if encoder:
+        config = json.loads((source / 'config.json').read_text())
+        if config.get('model_type') != 'modernbert':
+            raise ValueError('Unsupported GLiDE encoder architecture')
+        hidden = config['hidden_size']
+        embedding_name = 'embeddings.tok_embeddings.weight'
+        model_id = 'fastino/GLiDE-0.4B'
+        mandatory = (embedding_name, 'embeddings.norm.weight', 'final_norm.weight',
+                     'readout.weight', 'layers.0.attn.Wqkv.weight')
+        for directory in ('render_tokenizer', 'licenses', 'glide'):
+            if (source / directory).is_dir():
+                shutil.copytree(source / directory, output / directory, dirs_exist_ok=True,
+                                ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+    else:
+        hidden = 2048
+        embedding_name = 'embed_tokens.weight'
+        model_id = 'fastino/GLiDE-2B'
+        mandatory = (embedding_name, 'norm.weight', 'readout.weight',
+                     'layers.0.linear_attn.in_proj_qkv.weight', 'layers.23.self_attn.q_proj.weight')
 
     paths = sorted(source.glob('*.safetensors'))
     if not paths:
-        raise SystemExit('No safetensors found. Use: uv run hf download fastino/GLiDE-2B --local-dir GLiDE-2B')
+        raise SystemExit(f'No safetensors found. Use: uv run hf download {model_id}')
     tensors = {}
     ignored = []
     with (output / 'weights.bin').open('wb') as dest:
         for path in paths:
             with safe_open(str(path), framework='pt', device='cpu') as src:
                 for oldkey in sorted(src.keys()):
-                    name = canonical(oldkey)
+                    name = oldkey.removeprefix('model.') if encoder else canonical(oldkey)
                     if path.name == 'readout.safetensors':
-                        # Readout is always a separate 255 x 2048 classifier.
                         shape = list(src.get_slice(oldkey).get_shape())
-                        if len(shape) == 2 and shape[0] == 255 and shape[1] == 2048:
+                        if shape == [255, hidden]:
                             name = 'readout.weight'
                         elif shape == [255]:
                             name = 'readout.bias'
+                        else:
+                            name = None
+                    elif encoder and not oldkey.startswith(('model.embeddings.', 'model.layers.', 'model.final_norm.')):
+                        name = None
                     if name is None:
                         ignored.append(oldkey)
                         continue
@@ -183,13 +211,13 @@ def convert(source, output, embeddings='f16', chunk=32, layout='row', weight_bit
                         raise ValueError(f'duplicate normalized tensor {name}: {oldkey}')
                     shape = list(src.get_slice(oldkey).get_shape())
                     if weight_bits == 16:
-                        dtype = 'bf16x16' if len(shape) == 2 and name != 'embed_tokens.weight' else 'bf16'
+                        dtype = 'bf16x16' if len(shape) == 2 and name != embedding_name else 'bf16'
                     elif name.startswith('readout.') or len(shape) != 2:
                         dtype = 'f32'
-                    elif name == 'embed_tokens.weight':
-                        dtype = embeddings
+                    elif name == embedding_name:
+                        dtype = 'q8x16' if embeddings == 'q8' else embeddings
                     elif layout == 'tile16' and shape[0] % 16 == 0:
-                        attention = '.linear_attn.' in name or '.self_attn.' in name
+                        attention = any(part in name for part in ('.linear_attn.', '.self_attn.', '.attn.'))
                         bits = 8 if q8_attention and attention else weight_bits
                         dtype = 'q4nx16' if q4_codebook and bits == 4 else f'q{bits}x16'
                     else:
@@ -212,11 +240,11 @@ def convert(source, output, embeddings='f16', chunk=32, layout='row', weight_bit
                             raise AssertionError(dtype)
                     tensors[name] = {'shape': shape, 'dtype': dtype, 'offset': start, 'nbytes': dest.tell() - start}
                     print(f'{name:67} {dtype:>3} {tensors[name]["nbytes"] / 1e6:8.1f} MB', flush=True)
-    mandatory = ('embed_tokens.weight', 'norm.weight', 'readout.weight', 'layers.0.linear_attn.in_proj_qkv.weight', 'layers.23.self_attn.q_proj.weight')
     absent = [name for name in mandatory if name not in tensors]
     if absent:
         raise SystemExit(f'Conversion has missing required model tensors {absent}. Available first keys: {list(tensors)[:10]}')
-    index = {'version': 1, 'source': 'fastino/GLiDE-2B', 'embedding_dtype': embeddings, 'tensors': tensors}
+    index = {'version': 1, 'source': model_id, 'embedding_dtype': tensors[embedding_name]['dtype'],
+             'tensors': tensors}
     (output / 'index.json').write_text(json.dumps(index, indent=2))
     print(f'\nWrote {len(tensors)} tensors, {(output / "weights.bin").stat().st_size / 1e9:.3f} GB total')
     print(f'Skipped {len(ignored)} unused/vision/LM-head tensors')
@@ -224,9 +252,10 @@ def convert(source, output, embeddings='f16', chunk=32, layout='row', weight_bit
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--source', required=True, help='Downloaded GLiDE-2B checkpoint directory')
+    parser.add_argument('--source', required=True, help='Downloaded GLiDE checkpoint directory')
     parser.add_argument('--output', required=True, help='Destination directory')
-    parser.add_argument('--embeddings', choices=['f16', 'q4'], default='f16', help='Q4 embeddings save disk/RAM but may reduce quality')
+    parser.add_argument('--embeddings', choices=['f16', 'q8', 'q4'], default='f16',
+                        help='Quantize embeddings to reduce model size')
     parser.add_argument('--layout', choices=['row', 'tile16'], default='row',
                         help='Use tile16 for SIMD-packed matrices or row for the portable Q4 layout')
     parser.add_argument('--weight-bits', choices=[4, 6, 8, 16], type=int, default=4,

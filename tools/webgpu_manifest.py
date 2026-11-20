@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export browser buffer geometry for an existing packed GLiDE-2B checkpoint."""
+"""Export browser buffer geometry for an existing packed GLiDE checkpoint."""
 
 import argparse
 import json
@@ -62,6 +62,12 @@ def export_manifest(model, output):
     }
     if (model / "tokenizer.json").is_file():
         result["tokenizer"] = asset("tokenizer.json")
+    decision = json.loads((model / "decision_config.json").read_text())
+    if decision.get("backbone") == "encoder":
+        result["maxContext"] = decision["max_len"]
+        render = Path(decision.get("render_tokenizer") or "render_tokenizer")
+        result["renderTokenizer"] = asset(render / "tokenizer.json")
+        result["chatTemplate"] = asset(render / "chat_template.jinja")
     output.write_text(json.dumps(result, separators=(",", ":")) + "\n")
 
 

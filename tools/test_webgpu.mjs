@@ -13,9 +13,13 @@ const models = process.argv.slice(2).map(dir => ({
 }));
 if (!models.length) throw new Error("Pass one or more model directories containing webgpu.json");
 
-const stages = [
+const decoderStages = [
     ["layers.0.mlp.gate_proj.weight", 16, 64, 3],
     ["layers.3.self_attn.q_proj.weight", 32, 32, 17],
+];
+const encoderStages = [
+    ["layers.0.mlp.Wi.weight", 16, 64, 3],
+    ["layers.0.attn.Wqkv.weight", 32, 32, 17],
 ];
 const levels = [-127, -88, -67, -50, -36, -23, -12, 0, 10, 20, 31, 43, 56, 71, 92, 127];
 
@@ -144,22 +148,24 @@ try {
                 if (offset !== tensor.offset + tensor.nbytes) throw new Error("Incomplete tensor ranges");
                 totalRanges += ranges.length;
             }
-            const embedding = manifest.tensors["embed_tokens.weight"];
+            const embedding = manifest.tensors[entry.embeddingName];
             const embeddingRanges = weightRanges(embedding, cap);
             if (embeddingRanges.reduce((sum, range) => sum + range.byteLength, 0) !== embedding.nbytes) {
                 throw new Error("Embedding shard byte count disagrees with the index");
             }
             const firstEmbedding = embeddingRanges[0];
-            for await (const chunk of uploadTensor(device, manifest, manifestURL, "embed_tokens.weight", {
+            for await (const chunk of uploadTensor(device, manifest, manifestURL, entry.embeddingName, {
                 firstRow: 0, rowCount: firstEmbedding.rowCount,
             })) {
                 if (chunk.buffer.size !== firstEmbedding.bufferBytes) throw new Error("Incorrect embedding upload size");
                 chunk.buffer.destroy();
             }
             // Reproduce a slice starting at the junction of two embedding shards.
-            if (embeddingRanges.length < 2) throw new Error("Expected split embedding weights");
+            const splitEmbedding = embeddingRanges.length >= 2
+                ? embeddingRanges : weightRanges(embedding, embedding.bytesPerUnit);
+            if (splitEmbedding.length < 2) throw new Error("Expected split embedding weights");
             const nearBoundary = weightRanges(embedding, embedding.bytesPerUnit,
-                                               embeddingRanges[1].firstRow - 1, 2);
+                                               splitEmbedding[1].firstRow - 1, 2);
             for (const range of nearBoundary) {
                 await readWeightRange(manifest, manifestURL, range);
             }
@@ -220,7 +226,14 @@ try {
         return {adapter: adapterInfo, bindingLimit: device.limits.maxStorageBufferBindingSize, cases: out};
     }, {
         software,
-        cases: models.map(model => ({name: path.basename(model.dir), samples: stages.map(s => fixture(model, ...s))})),
+        cases: models.map(model => {
+            const encoder = "embeddings.tok_embeddings.weight" in model.manifest.tensors;
+            return {
+                name: path.basename(model.dir),
+                embeddingName: encoder ? "embeddings.tok_embeddings.weight" : "embed_tokens.weight",
+                samples: (encoder ? encoderStages : decoderStages).map(s => fixture(model, ...s)),
+            };
+        }),
     });
     console.log(JSON.stringify(results, null, 2));
 } finally {

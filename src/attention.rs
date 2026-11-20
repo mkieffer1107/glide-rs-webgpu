@@ -5,19 +5,19 @@ use rayon::prelude::*;
 use std::{arch::x86_64::*, mem::transmute};
 
 const HEAD: usize = 256;
-const KEY_BLOCK: usize = 512;
-const QUERIES: usize = 6;
+pub(super) const KEY_BLOCK: usize = 512;
+pub(super) const QUERIES: usize = 6;
 const QUERY_BLOCK: usize = 8 * QUERIES;
-const LANES: usize = 32;
+pub(super) const LANES: usize = 32;
 const QUANTIZED_BF16_MIN_KEYS: usize = 16_384;
 
-struct KeyBlock {
-    count: usize,
-    keys: Vec<[u32; LANES]>,
-    values: Vec<[u32; LANES]>,
+pub(super) struct KeyBlock {
+    pub(super) count: usize,
+    pub(super) keys: Vec<[u32; LANES]>,
+    pub(super) values: Vec<[u32; LANES]>,
 }
 
-fn pack_pair(low: f32, high: f32) -> u32 {
+pub(super) fn pack_pair(low: f32, high: f32) -> u32 {
     let low = half::bf16::from_f32(low).to_bits();
     let high = half::bf16::from_f32(high).to_bits();
     u32::from(low) | (u32::from(high) << 16)
@@ -25,40 +25,53 @@ fn pack_pair(low: f32, high: f32) -> u32 {
 
 impl KeyBlock {
     fn pack<const BF16: bool>(keys: &[Vec<f32>], values: &[Vec<f32>], group: usize) -> Self {
-        let stride = if BF16 { 2 } else { 1 };
         let start = group * HEAD;
-        let mut packed_keys = vec![[0; LANES]; keys.len().div_ceil(LANES) * HEAD / stride];
-        for (tile, rows) in keys.chunks(LANES).enumerate() {
-            let matrix = &mut packed_keys[tile * HEAD / stride..(tile + 1) * HEAD / stride];
-            for (k, row) in rows.iter().enumerate() {
-                for (d, channels) in row[start..start + HEAD].chunks_exact(stride).enumerate() {
-                    matrix[d][k] = if BF16 {
-                        pack_pair(channels[0], channels[1])
-                    } else {
-                        channels[0].to_bits()
-                    };
-                }
+        Self::pack_slices::<BF16, HEAD>(
+            keys.len(),
+            |i| &keys[i][start..start + HEAD],
+            |i| &values[i][start..start + HEAD],
+        )
+    }
+
+    pub(super) fn pack_slices<'a, const BF16: bool, const DIM: usize>(
+        count: usize,
+        key: impl Fn(usize) -> &'a [f32],
+        value: impl Fn(usize) -> &'a [f32],
+    ) -> Self {
+        let stride = if BF16 { 2 } else { 1 };
+        let mut packed_keys = vec![[0; LANES]; count.div_ceil(LANES) * DIM / stride];
+        for i in 0..count {
+            let start = i / LANES * DIM / stride;
+            let matrix = &mut packed_keys[start..start + DIM / stride];
+            for (packed, channels) in matrix.iter_mut().zip(key(i).chunks_exact(stride)) {
+                packed[i % LANES] = if BF16 {
+                    pack_pair(channels[0], channels[1])
+                } else {
+                    channels[0].to_bits()
+                };
             }
         }
 
-        let inner = values.len().div_ceil(stride);
-        let mut packed_values = vec![[0; LANES]; inner * HEAD / LANES];
-        for (i, rows) in values.chunks(stride).enumerate() {
-            for tile in 0..HEAD / LANES {
-                let column = start + tile * LANES;
+        let inner = count.div_ceil(stride);
+        let mut packed_values = vec![[0; LANES]; inner * DIM / LANES];
+        for i in 0..inner {
+            let low = value(i * stride);
+            let high = (BF16 && i * stride + 1 < count).then(|| value(i * stride + 1));
+            for tile in 0..DIM / LANES {
+                let column = tile * LANES;
                 let packed = &mut packed_values[tile * inner + i];
                 for (lane, word) in packed.iter_mut().enumerate() {
                     let c = column + lane;
                     *word = if BF16 {
-                        pack_pair(rows[0][c], rows.get(1).map_or(0.0, |r| r[c]))
+                        pack_pair(low[c], high.map_or(0.0, |row| row[c]))
                     } else {
-                        rows[0][c].to_bits()
+                        low[c].to_bits()
                     };
                 }
             }
         }
         Self {
-            count: keys.len(),
+            count,
             keys: packed_keys,
             values: packed_values,
         }
@@ -198,30 +211,11 @@ impl QueryTile {
             let block_max = score_max(row) * (1.0 / 16.0);
             self.maxima[i] = old_max.max(block_max);
             let rescale = (old_max - self.maxima[i]).exp();
-            self.sums[i] = self.sums[i] * rescale + exp_sum(row, self.maxima[i]);
+            self.sums[i] = self.sums[i] * rescale + exp_sum(row, self.maxima[i], 1.0 / 16.0);
             for x in &mut self.output[i] {
                 *x *= rescale;
             }
-            if BF16 {
-                let (blocks, tail) = row.as_chunks::<16>();
-                // exp_sum writes normal FP32 values or zero in its vector
-                // lanes. The scalar tail may also contain denormals.
-                for (block, values) in blocks.iter().enumerate() {
-                    let bf16 = _mm512_cvtneps_pbh(_mm512_loadu_ps(values.as_ptr()));
-                    let words = transmute::<__m256bh, [u32; 8]>(bf16);
-                    for (j, word) in words.into_iter().enumerate() {
-                        probs[block * 8 + j][i] = word;
-                    }
-                }
-                for (j, values) in tail.chunks(2).enumerate() {
-                    probs[blocks.len() * 8 + j][i] =
-                        pack_pair(values[0], values.get(1).copied().unwrap_or(0.0));
-                }
-            } else {
-                for (j, &value) in row.iter().enumerate() {
-                    probs[j][i] = value.to_bits();
-                }
-            }
+            pack_probs::<BF16>(row, probs, i);
         }
         for (tile, v) in block.values.chunks_exact(value_inner).enumerate() {
             let dots = product::<BF16>(&probs[..value_inner], v);
@@ -254,7 +248,7 @@ impl QueryTile {
 }
 
 #[target_feature(enable = "avx512f,avx512bf16")]
-unsafe fn product<const BF16: bool>(
+pub(super) unsafe fn product<const BF16: bool>(
     a: &[[u32; QUERIES]],
     b: &[[u32; LANES]],
 ) -> [[f32; LANES]; QUERIES] {
@@ -284,7 +278,7 @@ unsafe fn product<const BF16: bool>(
 }
 
 #[target_feature(enable = "avx512f")]
-unsafe fn score_max(scores: &[f32]) -> f32 {
+pub(super) unsafe fn score_max(scores: &[f32]) -> f32 {
     let (vectors, tail) = scores.as_chunks::<16>();
     let mut max = _mm512_set1_ps(f32::NEG_INFINITY);
     for row in vectors {
@@ -296,13 +290,16 @@ unsafe fn score_max(scores: &[f32]) -> f32 {
 }
 
 #[target_feature(enable = "avx512f")]
-unsafe fn exp_sum(scores: &mut [f32], max: f32) -> f32 {
+pub(super) unsafe fn exp_sum(scores: &mut [f32], max: f32, scale: f32) -> f32 {
     let (vectors, tail) = scores.as_chunks_mut::<16>();
     let maximum = _mm512_set1_ps(max);
-    let scale = _mm512_set1_ps(1.0 / 16.0);
+    let scale_vec = _mm512_set1_ps(scale);
     let mut sum = _mm512_setzero_ps();
     for row in vectors {
-        let x = _mm512_sub_ps(_mm512_mul_ps(_mm512_loadu_ps(row.as_ptr()), scale), maximum);
+        let x = _mm512_sub_ps(
+            _mm512_mul_ps(_mm512_loadu_ps(row.as_ptr()), scale_vec),
+            maximum,
+        );
         // Range-reduce to [-ln(2)/2, ln(2)/2] and evaluate degree-six exp.
         // Values below the FP32 normal range have negligible softmax mass.
         let n = _mm512_roundscale_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(
@@ -320,10 +317,36 @@ unsafe fn exp_sum(scores: &mut [f32], max: f32) -> f32 {
     }
     let mut total = _mm512_reduce_add_ps(sum);
     for x in tail {
-        *x = (*x * (1.0 / 16.0) - max).exp();
+        *x = (*x * scale - max).exp();
         total += *x;
     }
     total
+}
+
+#[target_feature(enable = "avx512f,avx512bf16")]
+pub(super) unsafe fn pack_probs<const BF16: bool>(
+    row: &[f32],
+    probs: &mut [[u32; QUERIES]],
+    query: usize,
+) {
+    if BF16 {
+        let (blocks, tail) = row.as_chunks::<16>();
+        for (block, values) in blocks.iter().enumerate() {
+            let bf16 = _mm512_cvtneps_pbh(_mm512_loadu_ps(values.as_ptr()));
+            let words = transmute::<__m256bh, [u32; 8]>(bf16);
+            for (j, word) in words.into_iter().enumerate() {
+                probs[block * 8 + j][query] = word;
+            }
+        }
+        for (j, values) in tail.chunks(2).enumerate() {
+            probs[blocks.len() * 8 + j][query] =
+                pack_pair(values[0], values.get(1).copied().unwrap_or(0.0));
+        }
+    } else {
+        for (j, &value) in row.iter().enumerate() {
+            probs[j][query] = value.to_bits();
+        }
+    }
 }
 
 #[cfg(test)]

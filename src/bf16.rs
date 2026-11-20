@@ -28,9 +28,9 @@ pub(crate) fn activate_silu(row: &mut [f32], gate: Option<&[f32]>, lookup: &[f32
         unsafe {
             if let Some(gate) = gate {
                 assert_eq!(row.len(), gate.len());
-                x86::activate::<true>(row, gate, lookup);
+                x86::activate::<true, false>(row, gate, lookup);
             } else {
-                x86::activate::<false>(row, &[], lookup);
+                x86::activate::<false, true>(row, &[], lookup);
             }
         }
         return;
@@ -43,6 +43,19 @@ pub(crate) fn activate_silu(row: &mut [f32], gate: Option<&[f32]>, lookup: &[f32
         for x in row {
             *x = round(silu(round(*x), lookup));
         }
+    }
+}
+
+pub(crate) fn activate_gelu_gate(row: &mut [f32], gate: &[f32], lookup: &[f32; 65536]) {
+    debug_assert_eq!(row.len(), gate.len());
+    #[cfg(target_arch = "x86_64")]
+    if row.len() % 16 == 0 && std::arch::is_x86_feature_detected!("avx512f") {
+        // SAFETY: The rows have equal widths in complete 16-value chunks.
+        unsafe { x86::activate::<true, true>(row, gate, lookup) };
+        return;
+    }
+    for (x, &g) in row.iter_mut().zip(gate) {
+        *x = round(lookup[(x.to_bits() >> 16) as usize] * g);
     }
 }
 
@@ -80,24 +93,28 @@ mod x86 {
     }
 
     #[target_feature(enable = "avx512f")]
-    pub(super) unsafe fn activate<const GATED: bool>(
+    pub(super) unsafe fn activate<const GATED: bool, const ACTIVATE_INPUT: bool>(
         row: &mut [f32],
         gate: &[f32],
         lookup: &[f32; 65536],
     ) {
         for (i, chunk) in row.as_chunks_mut::<16>().0.iter_mut().enumerate() {
-            let up = _mm512_loadu_ps(chunk.as_ptr());
-            let index = if GATED {
-                _mm512_srli_epi32::<16>(_mm512_castps_si512(_mm512_loadu_ps(
-                    gate.as_ptr().add(i * 16),
-                )))
+            let input = _mm512_loadu_ps(chunk.as_ptr());
+            let gate = if GATED {
+                _mm512_loadu_ps(gate.as_ptr().add(i * 16))
             } else {
-                bf16_bits(up)
+                input
+            };
+            let index = if GATED {
+                let value = if ACTIVATE_INPUT { input } else { gate };
+                _mm512_srli_epi32::<16>(_mm512_castps_si512(value))
+            } else {
+                bf16_bits(input)
             };
             let activated = _mm512_i32gather_ps::<4>(index, lookup.as_ptr());
             let output = if GATED {
                 let rounded = _mm512_castsi512_ps(_mm512_slli_epi32::<16>(bf16_bits(activated)));
-                _mm512_mul_ps(up, rounded)
+                _mm512_mul_ps(if ACTIVATE_INPUT { gate } else { input }, rounded)
             } else {
                 activated
             };

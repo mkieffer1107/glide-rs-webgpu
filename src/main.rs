@@ -1,13 +1,13 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use glide_cpu::GlideModel;
+use glide_cpu::DecisionModel;
 use indexmap::IndexMap;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{fs, path::Path, time::Instant};
 
 #[derive(Parser)]
-#[command(about = "Experimental Fastino GLiDE-2B quantized CPU decision runtime")]
+#[command(about = "Fastino GLiDE CPU decision runtime")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -122,7 +122,7 @@ fn answer(question: &Question, scores: Vec<f32>, latency_ms: f64) -> Result<Valu
 }
 
 fn decide(
-    engine: &GlideModel,
+    engine: &DecisionModel,
     req: Request,
     batch_size: usize,
     include_logits: bool,
@@ -170,7 +170,7 @@ fn decide(
     }
     let mut response = json!({"answers": answers});
     if has_typed_question {
-        response["model"] = json!(engine.decision.model_name.as_deref().unwrap_or("glide-2b"));
+        response["model"] = json!(engine.decision().model_name.as_deref().unwrap_or("glide-2b"));
         response["usage"] = json!({"input_tokens": input_tokens, "output_tokens": 0});
     }
     if include_logits {
@@ -183,7 +183,7 @@ fn decide(
 }
 
 fn measure(
-    engine: &GlideModel,
+    engine: &DecisionModel,
     prompts: &[&[u32]],
     options: &[usize],
     warmup: usize,
@@ -235,11 +235,15 @@ fn main() -> Result<()> {
                 filesize as f64 / 1e9,
                 index["tensors"].as_object().map_or(0, |m| m.len())
             );
-            let model = GlideModel::open(dir)?;
+            let model = DecisionModel::open(dir)?;
+            let (layers, hidden) = model.dimensions();
             println!(
                 "Backbone: {} layers, {} hidden; temperature={}",
-                model.cfg.num_hidden_layers, model.cfg.hidden_size, model.decision.temperature
+                layers, hidden, model.decision().temperature
             );
+            if let Some(context) = model.encoder_context() {
+                println!("Encoder context: {context} tokens");
+            }
         }
         Command::Decide {
             model,
@@ -248,7 +252,7 @@ fn main() -> Result<()> {
             include_logits,
             timings,
         } => {
-            let engine = GlideModel::open(Path::new(&model))?;
+            let engine = DecisionModel::open(Path::new(&model))?;
             let req: Request = serde_json::from_slice(&fs::read(request)?)?;
             let response = decide(&engine, req, batch_size, include_logits, timings)?;
             println!("{}", serde_json::to_string_pretty(&response)?);
@@ -267,7 +271,7 @@ fn main() -> Result<()> {
                 bail!("iterations and batch size must be positive");
             }
             let opening = Instant::now();
-            let engine = GlideModel::open(Path::new(&model))?;
+            let engine = DecisionModel::open(Path::new(&model))?;
             let load_ms = opening.elapsed().as_secs_f64() * 1000.0;
             if let Some(tokens) = tokens {
                 let data: Value = serde_json::from_slice(&fs::read(tokens)?)?;

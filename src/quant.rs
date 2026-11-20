@@ -66,6 +66,60 @@ pub(crate) fn tiled_weight(block: &[u8], row: usize, col: usize, quant: TileQuan
     scale * value as f32
 }
 
+/// Project tiled Q8 weights with FP32 activations on hosts without VNNI,
+/// including WebAssembly. Decode each group once for all prompt rows.
+pub(crate) fn matmul_q8_portable(
+    weights: &[u8],
+    rows: usize,
+    cols: usize,
+    inputs: &[Vec<f32>],
+) -> Vec<Vec<f32>> {
+    const GROUP_BYTES: usize = SCALE_BYTES + TILE_ROWS * BLOCK_COLS;
+    let stride = cols.div_ceil(BLOCK_COLS) * GROUP_BYTES;
+    let project_tile = |tile: &[u8]| {
+        let mut output = vec![[0.0; TILE_ROWS]; inputs.len()];
+        for (group, block) in tile.chunks_exact(GROUP_BYTES).enumerate() {
+            let scales: [f32; TILE_ROWS] = std::array::from_fn(|row| {
+                half::f16::from_le_bytes([block[2 * row], block[2 * row + 1]]).to_f32()
+            });
+            let mut decoded = [[0.0; BLOCK_COLS]; TILE_ROWS];
+            for (part, bytes) in block[SCALE_BYTES..].chunks_exact(4 * TILE_ROWS).enumerate() {
+                for (row, weights) in decoded.iter_mut().zip(bytes.chunks_exact(4)) {
+                    for (weight, &code) in row[part * 4..part * 4 + 4].iter_mut().zip(weights) {
+                        *weight = (i32::from(code) - 128) as f32;
+                    }
+                }
+            }
+
+            let start = group * BLOCK_COLS;
+            let end = (start + BLOCK_COLS).min(cols);
+            for (out, input) in output.iter_mut().zip(inputs) {
+                for ((sum, row), scale) in out.iter_mut().zip(decoded.iter()).zip(scales) {
+                    let dot: f32 = row.iter().zip(&input[start..end]).map(|(w, x)| w * x).sum();
+                    *sum += scale * dot;
+                }
+            }
+        }
+        output
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let tiles: Vec<_> = {
+        use rayon::prelude::*;
+        weights.par_chunks_exact(stride).map(project_tile).collect()
+    };
+    #[cfg(target_arch = "wasm32")]
+    let tiles: Vec<_> = weights.chunks_exact(stride).map(project_tile).collect();
+    (0..inputs.len())
+        .map(|token| {
+            let mut result = Vec::with_capacity(rows);
+            for tile in &tiles {
+                result.extend_from_slice(&tile[token]);
+            }
+            result
+        })
+        .collect()
+}
+
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use super::*;

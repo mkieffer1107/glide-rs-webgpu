@@ -2,30 +2,53 @@
 mod attention;
 mod bf16;
 mod delta;
+mod encoder;
+mod encoder_attention;
 pub mod model;
 mod profile;
 mod quant;
+mod runtime;
 pub mod weights;
 pub use model::GlideModel;
+pub use runtime::DecisionModel;
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 mod wasm {
     use super::*;
     use wasm_bindgen::prelude::*;
     #[wasm_bindgen]
-    pub struct WasmGlide { inner: GlideModel }
+    pub struct WasmGlide {
+        inner: DecisionModel,
+    }
     #[wasm_bindgen]
     impl WasmGlide {
         #[wasm_bindgen(constructor)]
-        pub fn new(config: &str, decision_config: &str, index: &str, weight_bytes: Vec<u8>) -> Result<WasmGlide, JsValue> {
-            GlideModel::from_parts(config, decision_config, index, weight_bytes)
-                .map(|inner| Self {inner})
+        pub fn new(
+            config: &str,
+            decision_config: &str,
+            index: &str,
+            weight_bytes: Vec<u8>,
+        ) -> Result<WasmGlide, JsValue> {
+            DecisionModel::from_parts(config, decision_config, index, weight_bytes)
+                .map(|inner| Self { inner })
                 .map_err(|e| JsValue::from_str(&e.to_string()))
         }
-        pub fn predict(&self, token_ids: Vec<u32>, option_count: usize) -> Result<JsValue, JsValue> {
-            let scores = self.inner.probabilities(&token_ids, option_count)
+        pub fn predict(
+            &self,
+            token_ids: Vec<u32>,
+            option_count: usize,
+        ) -> Result<JsValue, JsValue> {
+            let scores = self
+                .inner
+                .probabilities(&token_ids, option_count)
                 .map_err(|e| JsValue::from_str(&e.to_string()))?;
             serde_wasm_bindgen::to_value(&scores).map_err(|e| JsValue::from_str(&e.to_string()))
+        }
+        #[wasm_bindgen(js_name = predictLogits)]
+        pub fn predict_logits(&self, token_ids: Vec<u32>) -> Result<Vec<f32>, JsValue> {
+            self.inner
+                .predict_tokens(&token_ids)
+                .map_err(|e| JsValue::from_str(&e.to_string()))
         }
     }
 }

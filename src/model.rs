@@ -216,7 +216,7 @@ impl GlideModel {
             Weights::from_bytes(index_json, weights)?,
         )
     }
-    fn new(cfg: ModelConfig, decision: DecisionConfig, weights: Weights) -> Result<Self> {
+    pub(crate) fn new(cfg: ModelConfig, decision: DecisionConfig, weights: Weights) -> Result<Self> {
         let c = &cfg.text_config;
         if c.hidden_size != 2048
             || c.num_hidden_layers != 24
@@ -833,24 +833,28 @@ impl GlideModel {
     }
 
     pub fn probabilities_from_logits(&self, logits: &[f32], count: usize) -> Result<Vec<f32>> {
-        if count == 0 || count > 255 || count > logits.len() {
-            bail!("expected 1 to 255 choices with at least one logit per choice");
-        }
-        let mut logits = logits[..count].to_vec();
-        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0f32;
-        for x in &mut logits {
-            *x = ((*x - max) / self.decision.temperature).exp();
-            sum += *x;
-        }
-        if !sum.is_finite() || sum == 0. {
-            bail!("invalid probability normalization");
-        }
-        for x in &mut logits {
-            *x /= sum;
-        }
-        Ok(logits)
+        probabilities(logits, count, self.decision.temperature)
     }
+}
+
+pub(crate) fn probabilities(logits: &[f32], count: usize, temperature: f32) -> Result<Vec<f32>> {
+    if count == 0 || count > 255 || count > logits.len() {
+        bail!("expected 1 to 255 choices with at least one logit per choice");
+    }
+    let mut logits = logits[..count].to_vec();
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0f32;
+    for x in &mut logits {
+        *x = ((*x - max) / temperature).exp();
+        sum += *x;
+    }
+    if !sum.is_finite() || sum == 0. {
+        bail!("invalid probability normalization");
+    }
+    for x in &mut logits {
+        *x /= sum;
+    }
+    Ok(logits)
 }
 
 #[cfg(test)]

@@ -2,11 +2,13 @@ target/
 .venv/
 .bench/
 .pkg/
+pkg/
 model-q4/
 model-q4-tiled/
 model-q8/
 model-bf16/
 GLiDE-2B/
+GLiDE-0.4B/
 *.gguf
 *.safetensors
 weights.bin

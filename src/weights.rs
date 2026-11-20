@@ -209,6 +209,11 @@ impl<'a> Tensor<'a> {
                 return Ok(result);
             }
         }
+        if self.meta.dtype == "q8x16" {
+            return Ok(crate::quant::matmul_q8_portable(
+                self.data, self.meta.shape[0], self.meta.shape[1], x,
+            ));
+        }
         #[cfg(not(target_arch="wasm32"))]
         {
             use rayon::prelude::*;
@@ -364,6 +369,10 @@ mod tests {
                 data: &data,
             };
             let projected = matrix.matmul_tokens(&tokens).unwrap();
+            if matches!(kind, TileQuant::Q8) {
+                let portable = crate::quant::matmul_q8_portable(&data, rows, cols, &tokens);
+                assert_eq!(portable, projected);
+            }
             for (activation, output) in tokens.iter().zip(projected) {
                 for (r, actual) in output.into_iter().enumerate() {
                     let expected = activation

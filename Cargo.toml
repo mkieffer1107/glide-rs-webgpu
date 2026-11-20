@@ -2,7 +2,7 @@
 name = "glide-cpu"
 version = "0.1.0"
 edition = "2021"
-description = "Experimental quantized CPU inference for Fastino GLiDE-2B decisions; WASM-oriented core"
+description = "Quantized CPU inference for Fastino GLiDE decisions with a portable WASM core"
 license = "Apache-2.0"
 
 [lib]
@@ -21,6 +21,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wasm-bindgen = { version = "0.2", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
+libm = "0.2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 memmap2 = "0.9"

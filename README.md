@@ -1,8 +1,11 @@
 # GLiDE-CPU
 
-Native Rust CPU inference for Fastino GLiDE-2B / Qwen3.5-2B. The runtime reads
+Native Rust CPU inference for Fastino GLiDE-2B and GLiDE-0.4B. The runtime reads
 decision probabilities from the checkpoint's 255-way readout and supports
 choice, yes/no (`noul`), and score responses for text and JSON states.
+
+The sections below cover GLiDE-2B. The [GLiDE-0.4B guide](docs/glide-04b.md)
+covers the ModernBERT encoder, CPU benchmarks, and browser export.
 
 ## Run the compact Q8 download
 

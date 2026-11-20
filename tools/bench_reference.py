@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark upstream GLiDE-2B on CPU using the same token IDs as Rust."""
+"""Benchmark upstream GLiDE on CPU using the same token IDs as Rust."""
 
 import argparse
 import json
@@ -15,7 +15,7 @@ from make_request import use_upstream
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True, help="Downloaded Fastino GLiDE-2B snapshot")
+    parser.add_argument("--model", required=True, help="Downloaded Fastino GLiDE snapshot")
     parser.add_argument("--request", required=True, type=Path, help="Tokenized JSON from make_request.py")
     parser.add_argument("--question", help="Benchmark a single question by name")
     parser.add_argument("--warmup", type=int, default=1)

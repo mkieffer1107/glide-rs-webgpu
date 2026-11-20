@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare Rust input using the prompt renderer from the GLiDE-2B snapshot."""
+"""Prepare Rust input using the prompt renderer from the GLiDE snapshot."""
 
 import argparse
 import json
@@ -22,6 +22,12 @@ def load_prompter(model_dir):
 
     config = json.loads((model_dir / "decision_config.json").read_text(encoding="utf-8"))
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+    if config.get("backbone") == "encoder":
+        from glide.encoder import EncoderTokenizer
+
+        render_dir = config.get("render_tokenizer") or "render_tokenizer"
+        render = AutoTokenizer.from_pretrained(model_dir / render_dir, local_files_only=True)
+        tokenizer = EncoderTokenizer(render, tokenizer, config["max_len"], config["trunc_head"])
     return Prompter(tokenizer, config["codes"])
 
 
@@ -44,7 +50,7 @@ def prepare(prompter, request):
         if not 1 <= len(options) <= MAX_OPTIONS:
             raise RequestError(f"expected 1 to {MAX_OPTIONS} options for {name}")
         prompt = prompter.text(state, question, options)
-        ids = prompter.tokenizer.encode(prompt, add_special_tokens=False)
+        ids = prompter.tokenizer([prompt], add_special_tokens=False)["input_ids"][0]
         prepared[name] = {
             "type": question["type"],
             "input_ids": ids,
@@ -56,7 +62,7 @@ def prepare(prompter, request):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True, help="Downloaded Fastino GLiDE-2B snapshot")
+    parser.add_argument("--model", required=True, help="Downloaded Fastino GLiDE snapshot")
     parser.add_argument("--request", required=True, type=Path, help="System One request JSON")
     parser.add_argument("--output", required=True, type=Path, help="Output tokenized Rust request")
     parser.add_argument("--trace", action="store_true", help="Save prompts and token counts")
