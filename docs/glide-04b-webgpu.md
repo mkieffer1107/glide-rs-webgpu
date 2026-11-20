@@ -68,12 +68,19 @@ the MLP only for pooled rows. Local attention skips keys outside the
 64-token radius. The online softmax uses bounded scratch even in global
 layers. The forward pass reads back only the logits.
 
-On hardware that advertises packed dot products, the automatic path uses
-tiled integer dot products. For software adapters and devices without the
-packed-dot feature, the runtime dequantizes tiles into shared memory for
-FP32 accumulation. Both paths keep the same Q8 weights resident. Override
-the selection with `projection: "int8"` or `projection: "fp32"` when
-benchmarking.
+On hardware that advertises packed dot products, the automatic path times
+the packed INT8 kernel and two vector FMA kernels once during load. It
+chooses a tile for each of the four projection shapes and for two ranges
+of batch sizes. For software adapters and devices without the packed-dot
+feature, the automatic path dequantizes tiles into shared memory for FP32
+accumulation. All paths use the same resident Q8 weights.
+
+Pass `projection: "int8"` to use the original packed kernel,
+`projection: "int8-vector"` to force the 32-token vector tile, or
+`projection: "fp32"` for dequantized projections. The
+`projectionTiles` getter reports the automatic hardware choices keyed
+by input and output channel counts. The first map covers batches up to
+256 tokens and the second covers longer batches.
 
 ## Check parity and benchmark
 
@@ -92,6 +99,9 @@ node tools/test_encoder_attention.mjs
 Pass additional CPU or PyTorch reference JSON files to compare all 255
 logits. Add `--hardware --warmup 1 --runs 5` to measure a real GPU and
 `--wasm pkg` to also time the WASM build in the same Chromium process.
+Use `--compare-packed` with the automatic packed-dot hardware path or
+`--projection int8-vector` to alternate the two runtimes and check that
+every logit matches bit for bit.
 The attention check compares ragged sequences, the sliding window, and
 queries over the full 7,999-key context against a separate CPU calculation.
 
@@ -128,8 +138,8 @@ shorter prompts.
 
 ## Packed INT8 on M1 Max
 
-The runtime uses the 16-token by 32-output projection tile from `8178386`,
-which the Patient Messages Space already uses. The 32-token tile in
+The packed INT8 baseline is the 16-token by 32-output projection tile from
+`8178386`, which the Patient Messages Space uses. The packed 32-token tile in
 `39e4e83` improved forced packed INT8 timings on SwiftShader. On the M1 Max
 with Chrome's Metal adapter, full messages took 2.23–2.30 times as long
 with that tile. The hardware comparison used the same browser session,
@@ -167,3 +177,58 @@ node tools/bench_encoder_projections.mjs model-04b-q8 --baseline 39e4e83 --token
 node tools/test_encoder_webgpu.mjs model-04b-q8 examples/glide-04b.tokens.json cpu.json \
   --question intent --hardware --projection int8 --warmup 1 --runs 5
 ```
+
+## Vector FMA projections
+
+On Metal, Dawn expands packed INT8 dot products into byte unpacking and
+integer arithmetic. The vector kernels unpack coalesced Q8 tiles once
+into shared memory and compute four neighboring output channels with
+vector fused multiply-adds. The unscaled sums of 32 INT8 products fit
+exactly in FP32. The kernels apply the original group scales in the
+original order. [Dawn Metal lowering](https://github.com/google/dawn/blob/main/src/tint/lang/msl/writer/raise/raise.cc)
+
+Automatic selection compares the packed baseline with the 16-token and
+32-token vector tiles on the active device. It uses the real layer-zero
+weights and deterministic activations at 124 and 672 tokens, bounded by
+the model's batch cap. A vector kernel must match every projection output
+bit for bit and be at least 5% faster in the median of three paired
+dispatches. Batches of 32 or fewer tokens use the packed kernels.
+Calibration allocates up to 30.2 MB of temporary buffers during model
+load. Resident weights and inference scratch have the same size.
+For a vendored runtime, update `encoder.mjs` and `encoder-kernels.mjs`
+together.
+
+```bash
+export GLIDE_CHROMIUM="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+node tools/bench_encoder_projections.mjs model-04b-q8 --baseline 8178386 \
+  --vector --tokens 665,672,750,539 --hardware
+node tools/test_encoder_webgpu.mjs model-04b-q8 examples/glide-04b.tokens.json cpu.json \
+  --question intent --hardware --compare-packed --warmup 1 --runs 5
+```
+
+The four token counts are for MLP expansion, attention QKV, MLP
+contraction and attention output, in that order. Use `--tokens 124` for
+the single-prompt profile.
+
+Chromium 156 with SwiftShader ran one warm-up and three GPU-timed
+dispatches per kernel on four pinned CPU threads. Both vector kernels
+matched the packed kernel bit for bit on all four projections, including
+residual and offset writes. At 124 tokens, the 32-token vector tile
+reduced median projection times by 26–38%. The larger dispatches from
+the Patient Messages profile gave these medians.
+
+| Projection | Batch tokens | Packed INT8 | Vector 16×64 | Vector 32×64 |
+|---|---:|---:|---:|---:|
+| MLP expansion | 665 | 4.710 s | 3.802 s | 2.622 s |
+| Attention QKV | 672 | 2.911 s | 2.589 s | 1.511 s |
+| MLP contraction | 750 | 1.871 s | 2.034 s | 1.382 s |
+| Attention output | 539 | 0.727 s | 0.710 s | 0.489 s |
+
+One full-model forward per kernel on the same SwiftShader device scored
+the 107- and 124-token prompts together. The packed kernel took 106.53 s
+and the 32-token vector kernel took 75.58 s. All 510 logits matched bit
+for bit. The maximum absolute error against Rust Q8 was 0.02524 and
+both answers matched. Each runtime used 478.6 MB of GPU buffers.
+
+These timings measure the software adapter. Hardware selection uses
+timings from the active browser and device.

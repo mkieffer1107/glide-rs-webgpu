@@ -301,6 +301,99 @@ fn main(@builtin(workgroup_id) gid: vec3<u32>, @builtin(local_invocation_id) lid
 `;
 }
 
+function projectVector(tokens) {
+    const offsets = Array.from({length: tokens / 8}, (_, i) => i * 8);
+    const forTokens = source => offsets.map(source).join("\n");
+    return `
+struct Params { groups: u32, tokens: u32, rows: u32, first: u32, residual: u32 }
+@group(0) @binding(0) var<storage, read> weights: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read> acts: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output: array<vec4<f32>>;
+@group(0) @binding(3) var<uniform> p: Params;
+
+const TOKENS = ${tokens}u;
+var<workgroup> wTile: array<vec4<f32>, 32u * 16u>;
+var<workgroup> aTile: array<vec4<f32>, 8u * TOKENS>;
+var<workgroup> wScale: array<vec4<f32>, 16>;
+var<workgroup> aScale: array<f32, TOKENS>;
+
+fn store(token: u32, row: u32, value: vec4<f32>) {
+    if (token >= p.tokens) { return; }
+    let i = ((p.first + token) * p.rows + row) / 4u;
+    if (p.residual != 0u) {
+        output[i] += value;
+    } else {
+        output[i] = value;
+    }
+}
+
+@compute @workgroup_size(16, 8)
+fn main(@builtin(workgroup_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(local_invocation_index) lane: u32) {
+    let firstToken = gid.y * TOKENS;
+    // All four GLiDE-0.4B projections have output widths divisible by 64.
+    let row = gid.x * 64u + lid.x * 4u;
+    let col = lid.x % 4u;
+    ${forTokens(offset => `var c${offset} = vec4(0.0);`)}
+    for (var k = 0u; k < p.groups; k++) {
+        // Four adjacent Q8 weights are aligned in the checkpoint for each K word.
+        let base = (row / 16u * p.groups + k) * 34u;
+        let codes = weights[base + 2u + lid.y * 4u + col];
+        let w = lid.y * 64u + lid.x;
+        wTile[w] = vec4<f32>(codes & vec4(255u)) - vec4(128.0);
+        wTile[w + 16u] = vec4<f32>((codes >> vec4(8u)) & vec4(255u)) - vec4(128.0);
+        wTile[w + 32u] = vec4<f32>((codes >> vec4(16u)) & vec4(255u)) - vec4(128.0);
+        wTile[w + 48u] = vec4<f32>(codes >> vec4(24u)) - vec4(128.0);
+        if (lid.y == 0u) {
+            let pairs = weights[base + col / 2u];
+            let halves = select(pairs.xy, pairs.zw, col % 2u != 0u);
+            wScale[lid.x] = vec4(unpack2x16float(halves.x), unpack2x16float(halves.y));
+        }
+
+        for (var i = lane; i < TOKENS * 8u; i += 128u) {
+            let token = i / 8u;
+            let part = i % 8u;
+            var values = vec4(0.0);
+            var scale = 0.0;
+            if (firstToken + token < p.tokens) {
+                let a = ((firstToken + token) * p.groups + k) * 9u;
+                let word = acts[a + 1u + part];
+                let bytes = bitcast<vec4<i32>>(vec4(word) << vec4(24u, 16u, 8u, 0u));
+                values = vec4<f32>(bytes >> vec4(24u));
+                if (part == 0u) { scale = bitcast<f32>(acts[a]); }
+            }
+            aTile[part * TOKENS + token] = values;
+            if (part == 0u) { aScale[token] = scale; }
+        }
+
+        workgroupBarrier();
+        // The unscaled 32-term INT8 sums fit exactly in f32. Keep the same
+        // group scales and group accumulation order as the packed kernel.
+        ${forTokens(offset => `var s${offset} = vec4(0.0);`)}
+        for (var part = 0u; part < 8u; part++) {
+            let w = part * 64u + lid.x;
+            let a = part * TOKENS + lid.y;
+            let w0 = wTile[w];
+            let w1 = wTile[w + 16u];
+            let w2 = wTile[w + 32u];
+            let w3 = wTile[w + 48u];
+            ${forTokens(offset => `
+            let a${offset} = aTile[a + ${offset}u];
+            s${offset} = fma(vec4(a${offset}.x), w0, s${offset});
+            s${offset} = fma(vec4(a${offset}.y), w1, s${offset});
+            s${offset} = fma(vec4(a${offset}.z), w2, s${offset});
+            s${offset} = fma(vec4(a${offset}.w), w3, s${offset});`)}
+        }
+        let ws = wScale[lid.x];
+        ${forTokens(offset => `
+        c${offset} = fma(s${offset}, ws * aScale[lid.y + ${offset}u], c${offset});`)}
+        workgroupBarrier();
+    }
+    ${forTokens(offset => `store(firstToken + lid.y + ${offset}u, row, c${offset});`)}
+}
+`;
+}
+
 const rope = `
 struct Params { hidden: u32 }
 @group(0) @binding(0) var<storage, read_write> qkv: array<f32>;
@@ -449,23 +542,32 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `;
 
+async function createPipeline(device, name, code) {
+    const module = device.createShaderModule({label: `GLiDE ${name}`, code});
+    try {
+        return await device.createComputePipelineAsync({
+            label: module.label, layout: "auto", compute: {module, entryPoint: "main"},
+        });
+    } catch (error) {
+        const info = await module.getCompilationInfo();
+        const messages = info.messages.filter(message => message.type === "error")
+            .map(message => `${message.lineNum}:${message.linePos} ${message.message}`);
+        throw new Error(`GLiDE ${name}: ${messages.join("\n") || error.message}`, {cause: error});
+    }
+}
+
+export async function createVectorProjection(device, tokens) {
+    if (tokens !== 16 && tokens !== 32) throw new RangeError("Expected a 16- or 32-token projection tile");
+    const rows = 64;
+    const name = `vector ${tokens}x${rows}`;
+    const pipeline = await createPipeline(device, name, projectVector(tokens));
+    return {name, pipeline, tokens, rows};
+}
+
 export async function createEncoderKernels(device, packedDot, useFloat = false) {
     const shaders = {norm, pack, project: useFloat ? projectFloat() : project(packedDot),
-                     projectFew: projectFew(packedDot),
-                     rope, attention, gather, readout};
-    const entries = await Promise.all(Object.entries(shaders).map(async ([name, code]) => {
-        const module = device.createShaderModule({label: `GLiDE ${name}`, code});
-        try {
-            const pipeline = await device.createComputePipelineAsync({
-                label: module.label, layout: "auto", compute: {module, entryPoint: "main"},
-            });
-            return [name, pipeline];
-        } catch (error) {
-            const info = await module.getCompilationInfo();
-            const messages = info.messages.filter(message => message.type === "error")
-                .map(message => `${message.lineNum}:${message.linePos} ${message.message}`);
-            throw new Error(`GLiDE ${name}: ${messages.join("\n") || error.message}`, {cause: error});
-        }
-    }));
+                     projectFew: projectFew(packedDot), rope, attention, gather, readout};
+    const entries = await Promise.all(Object.entries(shaders).map(async ([name, code]) =>
+        [name, await createPipeline(device, name, code)]));
     return Object.fromEntries(entries);
 }

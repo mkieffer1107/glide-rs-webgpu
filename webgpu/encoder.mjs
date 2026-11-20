@@ -1,12 +1,13 @@
 import { uploadWeightSet } from "./weights.mjs";
 import {
-    createEncoderKernels, PACKED_GROUP_BYTES, PROJECTION_ROWS, PROJECTION_TOKENS, QUERY_TILE,
+    createEncoderKernels, createVectorProjection, PACKED_GROUP_BYTES, PROJECTION_ROWS, PROJECTION_TOKENS, QUERY_TILE,
     FLOAT_PROJECTION_ROWS, FLOAT_PROJECTION_TOKENS,
 } from "./encoder-kernels.mjs";
 
 const LOGITS = 255;
 const MLP_ROWS = 1024;
 const PARAM_BYTES = 32;
+const SHORT_PROJECTION_BATCH = 256;
 const embed = "embeddings.tok_embeddings.weight";
 
 async function fetchJSON(url, signal) {
@@ -104,7 +105,7 @@ async function checked(device, encode) {
     } finally {
         const errors = await Promise.all([device.popErrorScope(), device.popErrorScope()]);
         const error = errors.find(Boolean);
-        if (error) throw new Error(error.message);
+        if (error) throw new Error(error.message, {cause: error});
     }
 }
 
@@ -115,6 +116,117 @@ function gpuArray(device, label, array) {
     new Uint8Array(buffer.getMappedRange()).set(new Uint8Array(array.buffer, array.byteOffset, array.byteLength));
     buffer.unmap();
     return buffer;
+}
+
+const projectionKey = (columns, width) => `${columns}x${width}`;
+
+async function tuneProjections(device, weights, config, cap, baseline, candidates, signal) {
+    const {hidden, intermediate} = config;
+    const shapes = [
+        ["attn.Wqkv", hidden, 3 * hidden, false], ["attn.Wo", hidden, hidden, true],
+        ["mlp.Wi", hidden, 2 * intermediate, false], ["mlp.Wo", intermediate, hidden, true],
+    ];
+    const batches = [Math.min(124, cap)];
+    if (cap > SHORT_PROJECTION_BATCH) batches.push(Math.min(672, cap));
+    const capacity = batches.at(-1);
+    const buffers = [];
+    const allocate = (label, size, usage) => {
+        const buffer = device.createBuffer({label: `GLiDE projection tuning ${label}`, size, usage});
+        buffers.push(buffer);
+        return buffer;
+    };
+    const selections = [];
+    try {
+        const {acts, output, readback, params} = await checked(device, () => {
+            const storage = GPUBufferUsage.STORAGE;
+            const write = GPUBufferUsage.COPY_DST;
+            const bytes = capacity * Math.max(3 * hidden, 2 * intermediate) * 4;
+            const acts = allocate("activations", capacity * intermediate / 32 * PACKED_GROUP_BYTES, storage | write);
+            // Deterministic signed bytes with a nonzero scale per 32 channels.
+            const words = new Uint32Array(acts.size / 4);
+            let seed = 15937;
+            for (let i = 0; i < words.length; i += 9) {
+                words[i] = 0x3c800000;
+                for (let j = 1; j < 9; j++) {
+                    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+                    words[i + j] = seed;
+                }
+            }
+            device.queue.writeBuffer(acts, 0, words);
+            return {
+                acts, output: allocate("output", bytes, storage | write | GPUBufferUsage.COPY_SRC),
+                readback: allocate("readback", bytes, write | GPUBufferUsage.MAP_READ),
+                params: allocate("parameters", PARAM_BYTES, write | GPUBufferUsage.UNIFORM),
+            };
+        });
+        for (const tokens of batches) {
+            const choices = new Map();
+            for (const [name, columns, width, residual] of shapes) {
+                signal?.throwIfAborted();
+                const size = tokens * width * 4;
+                device.queue.writeBuffer(params, 0, Uint32Array.of(columns / 32, tokens, width, 0, +residual));
+                const matrix = weights.get(`layers.0.${name}.weight`);
+                const variants = await checked(device, () => [baseline, ...candidates].map(tile => ({
+                    tile, times: [],
+                    binding: device.createBindGroup({
+                        layout: tile.pipeline.getBindGroupLayout(0),
+                        entries: [matrix, acts, output, params].map((buffer, binding) => ({
+                            binding, resource: {buffer},
+                        })),
+                    }),
+                })));
+                const dispatch = ({tile, binding}, warmup) => {
+                    const encoder = device.createCommandEncoder();
+                    if (warmup) encoder.clearBuffer(output, 0, size);
+                    const pass = encoder.beginComputePass();
+                    pass.setPipeline(tile.pipeline);
+                    pass.setBindGroup(0, binding);
+                    pass.dispatchWorkgroups(Math.ceil(width / tile.rows), Math.ceil(tokens / tile.tokens));
+                    pass.end();
+                    if (warmup) encoder.copyBufferToBuffer(output, 0, readback, 0, size);
+                    return encoder.finish();
+                };
+                let expected;
+                for (const variant of variants) {
+                    await checked(device, () => device.queue.submit([dispatch(variant, true)]));
+                    await readback.mapAsync(GPUMapMode.READ, 0, size);
+                    try {
+                        const bits = new Uint32Array(readback.getMappedRange(0, size));
+                        if (!expected) expected = bits.slice();
+                        variant.exact = bits.every((word, i) => word === expected[i]);
+                    } finally {
+                        readback.unmap();
+                    }
+                }
+                const eligible = variants.filter(variant => variant.exact);
+                for (let run = 0; run < 3; run++) {
+                    signal?.throwIfAborted();
+                    const order = run % 2 ? eligible.slice().reverse() : eligible;
+                    for (const variant of order) {
+                        const command = dispatch(variant, false);
+                        const started = performance.now();
+                        device.queue.submit([command]);
+                        await device.queue.onSubmittedWorkDone();
+                        variant.times.push(performance.now() - started);
+                    }
+                }
+                let best = baseline;
+                let bestRatio = 0.95;
+                for (const variant of eligible.slice(1)) {
+                    const ratios = variant.times.map((ms, i) => ms / variants[0].times[i]).sort((a, b) => a - b);
+                    if (ratios[1] < bestRatio) {
+                        best = variant.tile;
+                        bestRatio = ratios[1];
+                    }
+                }
+                choices.set(projectionKey(columns, width), best);
+            }
+            selections.push(choices);
+        }
+        return selections;
+    } finally {
+        for (const buffer of buffers) buffer.destroy();
+    }
 }
 
 function prepareBatch(prompts, poolLast, rows) {
@@ -199,13 +311,13 @@ export class Glide04bWebGPU {
     #rotary;
     #workspace = new Map();
     #maxBatchTokens;
-    #useFloat;
+    #projection;
     #closed = false;
     #lost;
     #pending = Promise.resolve();
 
     static async load(url, {adapter, device, signal, onProgress, maxBatchTokens, projection = "auto"} = {}) {
-        if (!["auto", "int8", "fp32"].includes(projection)) throw new Error("Unknown projection kernel");
+        if (!["auto", "int8", "int8-vector", "fp32"].includes(projection)) throw new Error("Unknown projection kernel");
         const manifestURL = new URL(url, globalThis.location?.href);
         const manifest = await fetchJSON(manifestURL, signal);
         const [c, d] = await Promise.all([
@@ -236,14 +348,39 @@ export class Glide04bWebGPU {
             const software = adapter?.info.isFallbackAdapter ?? device.adapterInfo?.isFallbackAdapter;
             const useFloat = projection === "fp32" || (projection === "auto" && (software || !packedDot));
             const kernels = await createEncoderKernels(device, packedDot, useFloat);
+            const primary = {
+                pipeline: kernels.project,
+                rows: useFloat ? FLOAT_PROJECTION_ROWS : PROJECTION_ROWS,
+                tokens: useFloat ? FLOAT_PROJECTION_TOKENS : PROJECTION_TOKENS,
+                name: useFloat ? "fp32" : "packed INT8",
+            };
+            const plan = {mode: useFloat ? "fp32" : "int8", primary};
+            if (projection === "int8-vector") {
+                plan.mode = projection;
+                plan.primary = await createVectorProjection(device, 32);
+            }
             weights = await uploadWeightSet(device, manifest, manifestURL, config.names, {signal, onProgress});
             await checked(device, () => {
                 rotary[0] = gpuArray(device, "GLiDE full RoPE", rotaryTable(config.maxContext, config.globalTheta));
                 rotary[1] = config.localTheta === config.globalTheta ? rotary[0]
                     : gpuArray(device, "GLiDE local RoPE", rotaryTable(config.maxContext, config.localTheta));
             });
+            if (projection === "auto" && packedDot && software === false && cap > 32) {
+                try {
+                    const candidates = await Promise.all([16, 32].map(tokens => createVectorProjection(device, tokens)));
+                    plan.tuned = await tuneProjections(device, weights, config, cap, primary, candidates, signal);
+                } catch (error) {
+                    signal?.throwIfAborted();
+                    // Optional tuning can fail on a device that fits the packed kernel.
+                    const cause = error.cause ?? error;
+                    if (!(cause instanceof GPUOutOfMemoryError || cause instanceof GPUValidationError ||
+                          cause instanceof GPUPipelineError || cause.name === "OperationError")) {
+                        throw error;
+                    }
+                }
+            }
             signal?.throwIfAborted();
-            return new Glide04bWebGPU(device, ownsDevice, config, kernels, weights, rotary, cap, useFloat);
+            return new Glide04bWebGPU(device, ownsDevice, config, kernels, weights, rotary, cap, plan);
         } catch (error) {
             for (const buffer of weights?.values() ?? []) buffer.destroy();
             for (const buffer of new Set(rotary)) buffer.destroy();
@@ -252,7 +389,7 @@ export class Glide04bWebGPU {
         }
     }
 
-    constructor(device, ownsDevice, config, kernels, weights, rotary, maxBatchTokens, useFloat) {
+    constructor(device, ownsDevice, config, kernels, weights, rotary, maxBatchTokens, projection) {
         this.#device = device;
         this.#ownsDevice = ownsDevice;
         this.#config = config;
@@ -260,7 +397,7 @@ export class Glide04bWebGPU {
         this.#weights = weights;
         this.#rotary = rotary;
         this.#maxBatchTokens = maxBatchTokens;
-        this.#useFloat = useFloat;
+        this.#projection = projection;
         device.lost.then(info => {
             this.#lost = new Error(`WebGPU device lost: ${info.message || info.reason}`);
         });
@@ -268,7 +405,11 @@ export class Glide04bWebGPU {
 
     get maxContext() { return Math.min(this.#config.maxContext, this.#maxBatchTokens); }
     get maxBatchTokens() { return this.#maxBatchTokens; }
-    get projection() { return this.#useFloat ? "fp32" : "int8"; }
+    get projection() { return this.#projection.mode; }
+    get projectionTiles() {
+        return this.#projection.tuned?.map(choices =>
+            Object.fromEntries([...choices].map(([shape, tile]) => [shape, tile.name])));
+    }
     get gpuBufferBytes() {
         let bytes = 0;
         for (const buffer of this.#weights.values()) bytes += buffer.size;
@@ -405,13 +546,13 @@ export class Glide04bWebGPU {
                 add("pack", [src, acts], [columns, columns / 32, count, +gated],
                     Math.ceil(count * (columns / 32) / 64));
             const project = (name, dst, count, columns, width, first = 0, residual = false) => {
-                const few = count <= (this.#useFloat ? 16 : 8);
-                const tileRows = this.#useFloat ? FLOAT_PROJECTION_ROWS : PROJECTION_ROWS;
-                const tileTokens = this.#useFloat ? FLOAT_PROJECTION_TOKENS : PROJECTION_TOKENS;
-                add(few ? "projectFew" : "project", [weight(name), acts, dst],
+                const few = count <= (this.projection === "fp32" ? 16 : 8);
+                const choices = count > 32 ? this.#projection.tuned?.[+(count > SHORT_PROJECTION_BATCH)] : undefined;
+                const tile = choices?.get(projectionKey(columns, width)) ?? this.#projection.primary;
+                plan.dispatch(few ? kernels.projectFew : tile.pipeline, [weight(name), acts, dst],
                     [columns / 32, count, width, first, +residual],
-                    Math.ceil(width / (few ? 16 : tileRows)),
-                    Math.ceil(count / (few ? 4 : tileTokens)));
+                    Math.ceil(width / (few ? 16 : tile.rows)),
+                    Math.ceil(count / (few ? 4 : tile.tokens)));
             };
 
             norm(weight(embed), "embeddings.norm.weight", hidden, rows, 0, true);

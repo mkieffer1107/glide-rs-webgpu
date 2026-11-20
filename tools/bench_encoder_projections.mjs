@@ -13,15 +13,17 @@ const {positionals, values} = parseArgs({
         tokens: {type: "string", default: "124"},
         runs: {type: "string", default: "5"},
         hardware: {type: "boolean"},
+        vector: {type: "boolean"},
     },
 });
 const [modelDir] = positionals;
-const tokens = Number(values.tokens);
+const counts = values.tokens.split(",").map(Number);
 const runs = Number(values.runs);
-if (positionals.length !== 1 || !Number.isSafeInteger(tokens) || tokens < 1 || tokens > 7999 ||
+if (positionals.length !== 1 || ![1, 4].includes(counts.length) ||
+    !counts.every(n => Number.isSafeInteger(n) && n >= 1 && n <= 7999) ||
     !Number.isSafeInteger(runs) || runs < 1) {
     throw new Error("Usage: node tools/bench_encoder_projections.mjs MODEL [--baseline 8178386] " +
-                    "[--tokens 124] [--runs 5] [--hardware]");
+                    "[--tokens 124|665,672,750,539] [--runs 5] [--vector] [--hardware]");
 }
 const gitOptions = {cwd: fileURLToPath(new URL("..", import.meta.url)), encoding: "utf8"};
 const revision = execFileSync("git", ["rev-parse", "--verify", "--end-of-options", `${values.baseline}^{commit}`],
@@ -41,7 +43,7 @@ try {
     });
     const page = await browser.newPage();
     await page.goto(`http://127.0.0.1:${server.address().port}/`);
-    const result = await page.evaluate(async ({baseline, revision, tokens, runs, software}) => {
+    const result = await page.evaluate(async ({baseline, revision, counts, runs, software, vector}) => {
         const adapter = await navigator.gpu?.requestAdapter({forceFallbackAdapter: software,
             powerPreference: "high-performance"});
         if (!adapter || (!software && adapter.info.isFallbackAdapter)) {
@@ -59,7 +61,16 @@ try {
             const {readWeightRange} = await import("/webgpu/weights.mjs");
             const manifestURL = new URL("/model/webgpu.json", location.href);
             const manifest = await (await fetch(manifestURL)).json();
-            const [old, next] = await Promise.all([before, after].map(m => m.createEncoderKernels(device, packedDot)));
+            const old = await before.createEncoderKernels(device, packedDot);
+            const original = {
+                name: revision, pipeline: old.project, rows: before.PROJECTION_ROWS, tokens: before.PROJECTION_TOKENS,
+            };
+            const candidates = vector
+                ? await Promise.all([16, 32].map(n => after.createVectorProjection(device, n)))
+                : [{
+                    name: "current", pipeline: (await after.createEncoderKernels(device, packedDot)).project,
+                    rows: after.PROJECTION_ROWS, tokens: after.PROJECTION_TOKENS,
+                }];
             const storage = GPUBufferUsage.STORAGE;
             const write = GPUBufferUsage.COPY_DST;
             const copy = GPUBufferUsage.COPY_SRC;
@@ -80,8 +91,9 @@ try {
             }
 
             const cases = [];
-            for (const [name, residual] of [["mlp.Wi", false], ["attn.Wqkv", false],
-                                           ["mlp.Wo", true], ["attn.Wo", true]]) {
+            for (const [i, name] of ["mlp.Wi", "attn.Wqkv", "mlp.Wo", "attn.Wo"].entries()) {
+                const tokens = counts[i] ?? counts[0];
+                const residual = i >= 2;
                 const tensor = manifest.tensors[`layers.0.${name}.weight`];
                 if (tensor?.dtype !== "q8x16") throw new Error(`Expected Q8 weights for ${name}`);
                 const bytes = await readWeightRange(manifest, manifestURL,
@@ -112,18 +124,16 @@ try {
 
                 const dims = params([groups, tokens, width, first, +residual]);
                 const initial = Float32Array.from({length: outputBytes / 4}, (_, i) => 1.3 * Math.sin(i + 0.123));
-                const variants = [[before, old.project], [after, next.project]].map(([module, pipeline]) => ({
-                    pipeline, binding: bindings(pipeline, [weights, acts, output, dims]),
-                    x: Math.ceil(width / module.PROJECTION_ROWS), y: Math.ceil(tokens / module.PROJECTION_TOKENS),
-                    ms: [],
+                const variants = [original, ...candidates].map(tile => ({
+                    name: tile.name, pipeline: tile.pipeline, binding: bindings(tile.pipeline, [weights, acts, output, dims]),
+                    x: Math.ceil(width / tile.rows), y: Math.ceil(tokens / tile.tokens),
+                    ms: [], bitExact: true, maxError: 0,
                 }));
                 let expected;
-                let bitExact = true;
-                let maxError = 0;
                 // Check the projection and the rows outside its output slice during warm-up.
                 for (let run = -1; run < runs; run++) {
-                    for (const i of run % 2 === 0 ? [1, 0] : [0, 1]) {
-                        const variant = variants[i];
+                    const order = run % 2 === 0 ? variants.slice().reverse() : variants;
+                    for (const variant of order) {
                         device.queue.writeBuffer(output, 0, initial);
                         const cmd = device.createCommandEncoder();
                         const pass = cmd.beginComputePass(timestamps ? {timestampWrites: {
@@ -160,17 +170,17 @@ try {
                             if (values.some(value => !Number.isFinite(value))) {
                                 throw new Error(`${name} produced non-finite values`);
                             }
-                            if (i === 0) {
+                            if (variant === variants[0]) {
                                 expected = bits.slice();
                             } else {
                                 const reference = new Float32Array(expected.buffer);
                                 for (let j = 0; j < values.length; j++) {
                                     if (bits[j] === expected[j]) continue;
-                                    bitExact = false;
+                                    variant.bitExact = false;
                                     const error = Math.abs(values[j] - reference[j]);
-                                    maxError = Math.max(maxError, error);
-                                    if (error > 3e-5 + 2e-6 * Math.abs(reference[j])) {
-                                        throw new Error(`${name} differs from the baseline projection at element ${j}`);
+                                    variant.maxError = Math.max(variant.maxError, error);
+                                    if (vector || error > 3e-5 + 2e-6 * Math.abs(reference[j])) {
+                                        throw new Error(`${name} ${variant.name} differs from baseline at element ${j}`);
                                     }
                                 }
                             }
@@ -182,9 +192,15 @@ try {
                     const sorted = values.slice().sort((a,b) => a-b);
                     return (sorted[Math.floor((sorted.length - 1) / 2)] + sorted[Math.floor(sorted.length / 2)]) / 2;
                 };
-                cases.push({stage: name, width, columns, tokens, bitExact, maxError,
-                    baselineMs: variants[0].ms, tunedMs: variants[1].ms,
-                    baselineMedianMs: median(variants[0].ms), tunedMedianMs: median(variants[1].ms)});
+                const [reference, ...results] = variants.map(({name, ms, bitExact, maxError}) => ({
+                    name, ms, bitExact, maxError, medianMs: median(ms),
+                }));
+                const result = vector ? {candidates: results} : {
+                    bitExact: results[0].bitExact, maxError: results[0].maxError,
+                    tunedMs: results[0].ms, tunedMedianMs: results[0].medianMs,
+                };
+                cases.push({stage: name, width, columns, tokens,
+                    baselineMs: reference.ms, baselineMedianMs: reference.medianMs, ...result});
                 for (const b of [input, acts, weights, output, readback, dims]) b.destroy();
             }
             if (uncaptured.length) throw new Error(uncaptured.join("\n"));
@@ -194,7 +210,7 @@ try {
             URL.revokeObjectURL(baselineURL);
             device.destroy();
         }
-    }, {baseline, revision, tokens, runs, software});
+    }, {baseline, revision, counts, runs, software, vector: Boolean(values.vector)});
     console.log(JSON.stringify(result, null, 2));
 } finally {
     await browser?.close();
