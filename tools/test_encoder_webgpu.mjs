@@ -11,6 +11,7 @@ const {positionals, values} = parseArgs({
     options: {
         hardware: {type: "boolean"},
         projection: {type: "string", default: "auto"},
+        question: {type: "string"},
         wasm: {type: "string"},
         runs: {type: "string", default: "1"},
         warmup: {type: "string", default: "0"},
@@ -24,12 +25,16 @@ const tolerance = Number(values["max-error"]);
 if (!modelDir || !requestFile || !referenceFiles.length || !Number.isSafeInteger(runs) || runs < 1 ||
     !Number.isSafeInteger(warmup) || warmup < 0 || !Number.isFinite(tolerance) || tolerance < 0) {
     throw new Error("Usage: node tools/test_encoder_webgpu.mjs MODEL REQUEST REFERENCE [REFERENCES...] " +
-                    "[--runs 3] [--warmup 1] [--wasm pkg] [--hardware] [--projection auto|int8|fp32] [--max-error 0.25]");
+                    "[--question NAME] [--runs 3] [--warmup 1] [--wasm pkg] [--hardware] " +
+                    "[--projection auto|int8|fp32] [--max-error 0.25]");
 }
 const json = path => JSON.parse(readFileSync(path, "utf8"));
-const questions = Object.entries(json(requestFile).questions);
+const questions = Object.entries(json(requestFile).questions)
+    .filter(([name]) => values.question === undefined || name === values.question);
 const input = questions.map(([, q]) => q.input_ids);
-assert(input.length > 0, "The request needs at least one question");
+assert(input.length > 0, values.question === undefined
+    ? "The request needs at least one question"
+    : `Question ${values.question} was not found in ${requestFile}`);
 
 const server = createGlideServer(modelDir, values.wasm);
 await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));

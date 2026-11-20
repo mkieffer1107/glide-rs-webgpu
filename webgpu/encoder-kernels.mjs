@@ -1,6 +1,6 @@
 // GLiDE-0.4B uses 64-channel attention heads and group-32, tile-16 Q8 weights.
 export const QUERY_TILE = 16;
-export const PROJECTION_TOKENS = 16;
+export const PROJECTION_TOKENS = 32;
 export const PROJECTION_ROWS = 32;
 export const PACKED_GROUP_BYTES = 36;
 export const FLOAT_PROJECTION_TOKENS = 32;
@@ -94,12 +94,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `;
 
-const projectionHeader = `
+const projectionBindings = `
 struct Params { groups: u32, tokens: u32, rows: u32, first: u32, residual: u32 }
 @group(0) @binding(0) var<storage, read> weights: array<u32>;
 @group(0) @binding(1) var<storage, read> acts: array<u32>;
-@group(0) @binding(2) var<storage, read_write> output: array<f32>;
 @group(0) @binding(3) var<uniform> p: Params;
+`;
+
+const projectionHeader = projectionBindings + `
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
 fn store(token: u32, row: u32, value: f32) {
     if (token < p.tokens && row < p.rows) {
@@ -128,79 +131,108 @@ fn idot(a: u32, b: u32) -> i32 {
 }
 
 function project(packed) {
-    return projectionHeader + dotWGSL(packed) + `
-// One 16-token by 32-output tile per workgroup. Cache eight K groups
-// at a time, keeping the complete scratch below WebGPU's 16 KiB minimum.
-const K_GROUPS = 8u;
-var<workgroup> wTile: array<u32, K_GROUPS * 8u * 32u>;
-var<workgroup> wScale: array<f32, K_GROUPS * 32u>;
-var<workgroup> aTile: array<u32, K_GROUPS * 16u * 9u>;
+    // Generate the four independent token accumulators with constant offsets.
+    const tokenOffsets = [0, 8, 16, 24];
+    const accumulators = tokenOffsets.map((_, i) => `var acc${i} = vec4(0.0);`).join("\n    ");
+    const products = tokenOffsets.map((offset, i) => `{
+            let a = block * TOKENS + local.y + ${offset}u;
+            let words = Words(aLo[a], aHi[a]);
+            let sums = vec4(dotGroup(words, w0), dotGroup(words, w1),
+                            dotGroup(words, w2), dotGroup(words, w3));
+            acc${i} = fma(vec4<f32>(sums), scales * aScale[a], acc${i});
+        }`).join("\n        ");
+    const stores = tokenOffsets.map((offset, i) => `store(token + ${offset}u, row, acc${i});`).join("\n    ");
+    return projectionBindings + dotWGSL(packed) + `
+@group(0) @binding(2) var<storage, read_write> output: array<vec4<f32>>;
 
-fn weightBase(tile: u32, col: u32, group: u32) -> u32 {
-    return ((tile * 2u + col / 16u) * p.groups + group) * 136u;
+// Each of 64 lanes computes four tokens by four consecutive output rows.
+// The 32x32 tile reuses each weight word across 32 tokens. Six input groups
+// use 13,824 bytes of shared storage, within the 16 KiB WebGPU minimum.
+const TOKENS = ${PROJECTION_TOKENS}u;
+const ROWS = ${PROJECTION_ROWS}u;
+const K_GROUPS = 6u;
+struct Words { lo: vec4<u32>, hi: vec4<u32> }
+var<workgroup> wLo: array<vec4<u32>, K_GROUPS * ROWS>;
+var<workgroup> wHi: array<vec4<u32>, K_GROUPS * ROWS>;
+var<workgroup> aLo: array<vec4<u32>, K_GROUPS * TOKENS>;
+var<workgroup> aHi: array<vec4<u32>, K_GROUPS * TOKENS>;
+var<workgroup> wScale: array<f32, K_GROUPS * ROWS>;
+var<workgroup> aScale: array<f32, K_GROUPS * TOKENS>;
+
+fn dotGroup(a: Words, w: Words) -> i32 {
+    return idot(a.lo.x, w.lo.x) + idot(a.lo.y, w.lo.y)
+         + idot(a.lo.z, w.lo.z) + idot(a.lo.w, w.lo.w)
+         + idot(a.hi.x, w.hi.x) + idot(a.hi.y, w.hi.y)
+         + idot(a.hi.z, w.hi.z) + idot(a.hi.w, w.hi.w);
 }
 
-@compute @workgroup_size(16, 8)
-fn main(@builtin(workgroup_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>,
+fn store(token: u32, row: u32, value: vec4<f32>) {
+    if (token < p.tokens && row < p.rows) {
+        let index = ((p.first + token) * p.rows + row) / 4u;
+        if (p.residual != 0u) {
+            output[index] += value;
+        } else {
+            output[index] = value;
+        }
+    }
+}
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(workgroup_id) gid: vec3<u32>, @builtin(local_invocation_id) local: vec3<u32>,
         @builtin(local_invocation_index) lane: u32) {
-    let firstRow = gid.x * 32u;
-    let firstToken = gid.y * 16u;
-    var accum = vec4(0.0);
+    let firstRow = gid.x * ROWS;
+    let firstToken = gid.y * TOKENS;
+    ${accumulators}
     for (var start = 0u; start < p.groups; start += K_GROUPS) {
         let count = min(K_GROUPS, p.groups - start);
-        for (var i = lane; i < count * 256u; i += 128u) {
-            let col = i % 32u;
-            let part = (i / 32u) % 8u;
-            var word = 0u;
-            if (firstRow + col < p.rows) {
-                let base = weightBase(gid.x, col, start + i / 256u);
-                word = weights[base + 8u + part * 16u + col % 16u] ^ 0x80808080u;
-            }
-            wTile[i] = word;
-        }
-        for (var i = lane; i < count * 32u; i += 128u) {
-            let col = i % 32u;
+        for (var i = lane; i < count * ROWS; i += 64u) {
+            let col = i % ROWS;
+            let row = firstRow + col;
+            var words: Words;
             var scale = 0.0;
-            if (firstRow + col < p.rows) {
-                let base = weightBase(gid.x, col, start + i / 32u);
-                scale = unpack2x16float(weights[base + (col % 16u) / 2u])[col % 2u];
+            if (row < p.rows) {
+                let base = (row / 16u * p.groups + start + i / ROWS) * 136u;
+                let word = base + 8u + row % 16u;
+                let sign = vec4(0x80808080u);
+                words.lo = vec4(weights[word], weights[word + 16u], weights[word + 32u], weights[word + 48u]) ^ sign;
+                words.hi = vec4(weights[word + 64u], weights[word + 80u], weights[word + 96u], weights[word + 112u]) ^ sign;
+                scale = unpack2x16float(weights[base + (row % 16u) / 2u])[row % 2u];
             }
-            wScale[i] = scale;
+            // Keep adjacent lanes' vector loads contiguous for each of the four output channels.
+            let dst = i - col + (col % 4u) * 8u + col / 4u;
+            wLo[dst] = words.lo;
+            wHi[dst] = words.hi;
+            wScale[dst] = scale;
         }
-        for (var i = lane; i < count * 144u; i += 128u) {
-            let token = firstToken + (i / 9u) % 16u;
-            var word = 0u;
+        for (var i = lane; i < count * TOKENS; i += 64u) {
+            let token = firstToken + i % TOKENS;
+            var words: Words;
+            var scale = 0.0;
             if (token < p.tokens) {
-                word = acts[(token * p.groups + start + i / 144u) * 9u + i % 9u];
+                let word = (token * p.groups + start + i / TOKENS) * 9u;
+                words.lo = vec4(acts[word + 1u], acts[word + 2u], acts[word + 3u], acts[word + 4u]);
+                words.hi = vec4(acts[word + 5u], acts[word + 6u], acts[word + 7u], acts[word + 8u]);
+                scale = bitcast<f32>(acts[word]);
             }
-            aTile[i] = word;
+            aLo[i] = words.lo;
+            aHi[i] = words.hi;
+            aScale[i] = scale;
         }
         workgroupBarrier();
-        for (var k = 0u; k < count; k++) {
-            let a = k * 144u + lid.y * 9u;
-            let w = k * 256u + lid.x;
-            var sum = vec4<i32>(0);
-            for (var part = 0u; part < 8u; part++) {
-                let a0 = aTile[a + 1u + part];
-                let a1 = aTile[a + 73u + part];
-                let w0 = wTile[w + part * 32u];
-                let w1 = wTile[w + part * 32u + 16u];
-                sum += vec4(idot(a0, w0), idot(a0, w1), idot(a1, w0), idot(a1, w1));
-            }
-            let s = k * 32u + lid.x;
-            let ws = vec2(wScale[s], wScale[s + 16u]);
-            let a0 = bitcast<f32>(aTile[a]);
-            let a1 = bitcast<f32>(aTile[a + 72u]);
-            accum = fma(vec4<f32>(sum), vec4(ws * a0, ws * a1), accum);
+        for (var block = 0u; block < count; block++) {
+            let w = block * ROWS + local.x;
+            let w0 = Words(wLo[w], wHi[w]);
+            let w1 = Words(wLo[w + 8u], wHi[w + 8u]);
+            let w2 = Words(wLo[w + 16u], wHi[w + 16u]);
+            let w3 = Words(wLo[w + 24u], wHi[w + 24u]);
+            let scales = vec4(wScale[w], wScale[w + 8u], wScale[w + 16u], wScale[w + 24u]);
+            ${products}
         }
         workgroupBarrier();
     }
-    let token = firstToken + lid.y;
-    let row = firstRow + lid.x;
-    store(token, row, accum.x);
-    store(token, row + 16u, accum.y);
-    store(token + 8u, row, accum.z);
-    store(token + 8u, row + 16u, accum.w);
+    let token = firstToken + local.y;
+    let row = firstRow + local.x * 4u;
+    ${stores}
 }
 `;
 }
